@@ -92,12 +92,21 @@ port : 8080                 # bind port
 timeout : 1000              # ms to wait before acquiring a WS connection
 idletimeout : 60000         # ms before closing excess idle connections
 secretkey : ThisIsASecret   # must match the client's secretkey
+# Bound domains: when set, only requests whose Host hostname is in this list
+# are accepted; IP and unlisted hosts -> 403.
+#allowedhosts :
+# - your-domain.example.com
 ```
 
 The server is a transparent catch-all reverse proxy: every path except
 `/register` and `/status` is forwarded to a HOW client. There is no
 caller-provided destination header — the real upstream is configured on the
 client.
+
+**Bound-domain validation** (`allowedhosts`): when configured, the server
+rejects any request whose `Host` header hostname is an IP address or is not in
+the list (HTTP 403). This prevents callers from bypassing the bound domain by
+hitting the server IP directly. Empty = allow any host.
 
 ### Client (`config.client.example.cfg`)
 
@@ -108,13 +117,9 @@ targets :                          # HOW servers to dial out to
 poolidlesize : 10                  # idle WS connections to keep per server
 poolmaxsize : 100                   # max concurrent WS connections per server
 secretkey : ThisIsASecret          # must match the server's secretkey
-# Optional client-side access control (applied to the arrival URL):
-#blacklist :
-# - method : ".*"
-#   url : ".*forbidden.*"
 # Routes: arrival host (what the caller targets on the server) -> upstream base.
-# The client appends the request path to the upstream base. All headers
-# (Authorization, etc.) are forwarded transparently.
+# The client appends the request path. Only listed hosts are forwarded; any
+# other host or IP -> 527 "No route".
 routes :
  "127.0.0.1:8080" : "http://internal-api.local"
  "llm.example.com" : "https://api.openai.com/v1"
