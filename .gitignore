@@ -1,0 +1,21 @@
+/target
+*.log
+ssl/
+*.key
+*.crt
+
+# IntelliJ IDEA
+.idea
+
+# Reference Go checkout (root-gg/wsp, kept locally for comparison; not part of
+# this repo — it has its own nested .git).
+/original/
+
+# LLM demo scripts: they read the real bearer token at runtime from
+# ~/.pi/agent/models.json (Authorization: Bearer $KEY). Keep them local so the
+# real credentials / the path to them are never committed.
+scripts/llm.sh
+scripts/llm_wsp.sh
+
+
+

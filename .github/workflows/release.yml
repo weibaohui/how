@@ -1,0 +1,102 @@
+name: Build and Release
+
+on:
+  push:
+    branches: ["main"]
+    tags:
+      - "v*"
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.archive }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (native on ubuntu-latest)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use-cross: false
+            archive: how-linux-x64
+          # Linux aarch64 (cross-compiled on ubuntu via cross)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use-cross: true
+            archive: how-linux-arm64
+          # macOS Apple Silicon (native on macos-latest)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use-cross: false
+            archive: how-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross == true
+        run: cargo install cross --locked
+
+      - name: Build (cross)
+        if: matrix.use-cross == true
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: matrix.use-cross == false
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -eux
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/how-server dist/
+          cp target/${{ matrix.target }}/release/how-client dist/
+          cp target/${{ matrix.target }}/release/how-test-api dist/
+          cp config.example.cfg config.client.example.cfg README.md dist/
+          tar -czf ${{ matrix.archive }}.tar.gz -C dist .
+          sha256sum ${{ matrix.archive }}.tar.gz > ${{ matrix.archive }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.tar.gz
+            ${{ matrix.archive }}.tar.gz.sha256
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: List artifacts
+        run: find artifacts -type f | sort
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/how-linux-x64/*
+            artifacts/how-linux-arm64/*
+            artifacts/how-darwin-arm64/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
