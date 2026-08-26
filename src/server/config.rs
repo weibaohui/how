@@ -18,6 +18,12 @@ pub struct Config {
     pub idle_timeout: i64,
     #[serde(rename = "secretkey", default)]
     pub secret_key: String,
+    /// Allowed arrival hostnames (the hostname part of the request's `Host`
+    /// header). When non-empty, a request is only accepted if its `Host`
+    /// hostname matches one of these; requests addressed by IP (or any
+    /// unlisted host) are rejected (HTTP 403). Empty = allow any host.
+    #[serde(rename = "allowedhosts", default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_host() -> String {
@@ -41,6 +47,7 @@ pub fn new_config() -> Config {
         timeout: default_timeout(),
         idle_timeout: default_idle_timeout(),
         secret_key: String::new(),
+        allowed_hosts: Vec::new(),
     }
 }
 
