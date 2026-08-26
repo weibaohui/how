@@ -5,7 +5,7 @@
 #   make build        debug build
 #   make test         Rust integration tests (sequential)
 #   make e2e          shell end-to-end test (curl)
-#   make run-server   build & run the server with config.example.cfg
+#   make run-server   build & run the server with config.server.example.cfg
 #   make run-client   build & run the client with config.client.example.cfg
 #   make clean        cargo clean
 
@@ -37,7 +37,7 @@ clean:
 	$(CARGO) clean
 
 run-server: release
-	./target/release/how-server -config config.example.cfg
+	./target/release/how-server -config config.server.example.cfg
 
 run-client: release
 	./target/release/how-client -config config.client.example.cfg

@@ -64,7 +64,7 @@ jobs:
           cp target/${{ matrix.target }}/release/how-server dist/
           cp target/${{ matrix.target }}/release/how-client dist/
           cp target/${{ matrix.target }}/release/how-test-api dist/
-          cp config.example.cfg config.client.example.cfg README.md dist/
+          cp config.server.example.cfg config.client.example.cfg README.md dist/
           tar -czf ${{ matrix.archive }}.tar.gz -C dist .
           sha256sum ${{ matrix.archive }}.tar.gz > ${{ matrix.archive }}.tar.gz.sha256
 

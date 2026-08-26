@@ -2,8 +2,8 @@
 
 #[tokio::main]
 async fn main() {
-    // Load configuration (Go-style `-config` flag, default config.example.cfg).
-    let config_file = how::cli::string_flag("config", "config.example.cfg");
+    // Load configuration (Go-style `-config` flag, default config.server.example.cfg).
+    let config_file = how::cli::string_flag("config", "config.server.example.cfg");
 
     let config = match how::server::load_configuration(&config_file) {
         Ok(c) => c,

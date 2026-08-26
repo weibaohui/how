@@ -40,7 +40,7 @@ Start a server (default binds `127.0.0.1:8080`):
 
 ```bash
 make run-server
-# or: ./target/release/how-server -config config.example.cfg
+# or: ./target/release/how-server -config config.server.example.cfg
 ```
 
 Start a client. Its `routes` maps the host the caller targets on the server to
@@ -78,12 +78,12 @@ containing `how-server`, `how-client`, `how-test-api` and the example configs:
 
 ```bash
 tar -xzf how-linux-x64.tar.gz
-./how-server -config config.example.cfg
+./how-server -config config.server.example.cfg
 ```
 
 ## Configuration
 
-### Server (`config.example.cfg`)
+### Server (`config.server.example.cfg`)
 
 ```yaml
 ---
