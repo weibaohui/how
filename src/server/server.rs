@@ -126,12 +126,13 @@ impl Server {
             // Disable Nagle so small WebSocket frames do not stall behind
             // delayed-ACK (~40ms) on the proxy tunnel.
             let _ = stream.set_nodelay(true);
+            let peer_ip = peer.ip();
             let inner = self.inner.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let inner = inner.clone();
-                    async move { handle(inner, req).await }
+                    async move { handle(inner, req, peer_ip).await }
                 });
                 if let Err(e) = http1::Builder::new()
                     .serve_connection(io, svc)
@@ -223,12 +224,13 @@ async fn acquire(
 async fn handle(
     inner: Arc<Inner>,
     req: Request<Incoming>,
+    peer_ip: std::net::IpAddr,
 ) -> Result<Response<Boxed>, std::convert::Infallible> {
     let path = req.uri().path().to_string();
     match path.as_str() {
         "/register" => Ok(handle_register(inner, req).await),
         "/status" => Ok(handle_status()),
-        _ => Ok(handle_request(inner, req).await),
+        _ => Ok(handle_request(inner, req, peer_ip).await),
     }
 }
 
@@ -265,7 +267,7 @@ fn build_request(
     if !inner.config.allowed_hosts.is_empty() {
         let hostname = host_name(&host);
         if hostname.parse::<std::net::IpAddr>().is_ok() {
-            return Err(host_forbidden("Host must be a domain, not an IP"));
+            return Err(forbidden("Host must be a domain, not an IP"));
         }
         let allowed = inner
             .config
@@ -273,7 +275,7 @@ fn build_request(
             .iter()
             .any(|h| h.eq_ignore_ascii_case(&hostname));
         if !allowed {
-            return Err(host_forbidden(&format!("Host not allowed: {hostname}")));
+            return Err(forbidden(&format!("Host not allowed: {hostname}")));
         }
     }
 
@@ -331,9 +333,9 @@ fn host_name(host_header: &str) -> String {
         .to_string()
 }
 
-/// Build a 403 Forbidden response for a host-validation failure.
-fn host_forbidden(msg: &str) -> Response<Boxed> {
-    log::log(format!("host forbidden: {msg}"));
+/// Build a 403 Forbidden response with a message body.
+fn forbidden(msg: &str) -> Response<Boxed> {
+    log::log(msg.to_string());
     Response::builder()
         .status(StatusCode::FORBIDDEN)
         .body(Full::new(Bytes::copy_from_slice(msg.as_bytes())).boxed())
@@ -341,7 +343,39 @@ fn host_forbidden(msg: &str) -> Response<Boxed> {
 }
 
 /// `/request`: forward an HTTP request through an idle proxy connection.
-async fn handle_request(inner: Arc<Inner>, req: Request<Incoming>) -> Response<Boxed> {
+async fn handle_request(
+    inner: Arc<Inner>,
+    req: Request<Incoming>,
+    peer_ip: std::net::IpAddr,
+) -> Response<Boxed> {
+    // --- Gatekeeper checks (before touching the proxy pool / backend) ---
+
+    // 1) Source IP whitelist.
+    if !inner.config.allowips.is_empty() {
+        let allowed = inner
+            .config
+            .allowips
+            .iter()
+            .any(|ip| *ip == peer_ip.to_string());
+        if !allowed {
+            return forbidden(&format!("DENY {}", peer_ip));
+        }
+    }
+
+    // 2) API key validation (Authorization: Bearer <key>).
+    if !inner.config.apikeys.is_empty() {
+        let token = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.trim().to_string()));
+        match token {
+            Some(t) if inner.config.apikeys.iter().any(|k| k == &t) => {}
+            Some(_) => return forbidden("Invalid API key"),
+            None => return forbidden("Missing or invalid Authorization header"),
+        }
+    }
+
     let http_req = match build_request(&inner, &req) {
         Ok(r) => r,
         Err(resp) => return resp,

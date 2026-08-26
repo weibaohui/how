@@ -24,6 +24,16 @@ pub struct Config {
     /// unlisted host) are rejected (HTTP 403). Empty = allow any host.
     #[serde(rename = "allowedhosts", default)]
     pub allowed_hosts: Vec<String>,
+    /// Source IP whitelist. When non-empty, only requests from these IPs are
+    /// served; any other source IP is rejected (403 "DENY <ip>").
+    #[serde(rename = "allowips", default)]
+    pub allowips: Vec<String>,
+    /// API key whitelist. When non-empty, every proxied request must carry an
+    /// `Authorization: Bearer <key>` header whose key is in this list; missing
+    /// or non-matching keys are rejected (403). Prevents scanners from pushing
+    /// requests through to the backend.
+    #[serde(rename = "apikeys", default)]
+    pub apikeys: Vec<String>,
 }
 
 fn default_host() -> String {
@@ -48,6 +58,8 @@ pub fn new_config() -> Config {
         idle_timeout: default_idle_timeout(),
         secret_key: String::new(),
         allowed_hosts: Vec::new(),
+        allowips: Vec::new(),
+        apikeys: Vec::new(),
     }
 }
 
