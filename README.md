@@ -1,5 +1,7 @@
 # HOW — HTTP On WebSocket
 
+[English](README.md) | [中文](readme.zh.md)
+
 A transparent reverse HTTP proxy tunneled over WebSockets, written in Rust.
 
 **HOW** = **H**TTP **O**n **W**ebsocket. A HOW **client** runs inside an
@@ -8,10 +10,6 @@ public HOW **server** over a WebSocket. A caller sends a normal HTTP request
 to the server; the server forwards it transparently to the client, which
 routes it to a configured upstream and streams the response back. No inbound
 firewall hole is needed on the internal side — the tunnel is always outbound.
-
-A redesign of [root-gg/wsp](https://github.com/root-gg/wsp): the caller uses
-it like any reverse proxy (its own path, its own `Authorization`), while the
-**real upstream lives in the client's config**, not in a request header.
 
 > This README is a hands-on tutorial — follow it top to bottom:
 > [understand the model](#1-how-it-works) → [build & try it](#2-quick-start)
