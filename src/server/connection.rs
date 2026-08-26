@@ -36,9 +36,11 @@ pub fn msg_text(msg: &Message) -> Option<String> {
 }
 
 /// Decode a websocket Message into a Binary payload, if it is a binary message.
-pub fn msg_binary(msg: &Message) -> Option<Vec<u8>> {
+/// Returns the underlying `Bytes` (a cheap refcount clone — no data copy) so
+/// the caller can forward it to the HTTP body without a `to_vec()` copy.
+pub fn msg_binary(msg: &Message) -> Option<Bytes> {
     match msg {
-        Message::Binary(b) => Some(b.to_vec()),
+        Message::Binary(b) => Some(b.clone()),
         _ => None,
     }
 }
@@ -239,7 +241,7 @@ impl Connection {
                     return Ok(());
                 }
                 Some(chunk) => {
-                    if body_tx.send_data(Bytes::from(chunk)).await.is_err() {
+                    if body_tx.send_data(chunk).await.is_err() {
                         // The HTTP client went away; stop draining.
                         return Err("client gone".to_string());
                     }

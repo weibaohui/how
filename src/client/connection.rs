@@ -429,7 +429,7 @@ async fn serve(
                         if b.is_empty() {
                             continue;
                         }
-                        if write_tx.send(Message::binary(b.to_vec())).await.is_err() {
+                        if write_tx.send(Message::binary(b)).await.is_err() {
                             stream_ok = false;
                             break;
                         }
