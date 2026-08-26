@@ -244,7 +244,10 @@ fn handle_status() -> Response<Boxed> {
 /// destination URL is reconstructed from the arrival `Host` header and the
 /// request path; the client routes it to the configured upstream. All headers
 /// (Authorization, Content-Type, custom) are forwarded transparently.
-fn build_request(inner: &Arc<Inner>, req: &Request<Incoming>) -> HttpRequest {
+fn build_request(
+    inner: &Arc<Inner>,
+    req: &Request<Incoming>,
+) -> Result<HttpRequest, Response<Boxed>> {
     // Reconstruct the arrival URL from the Host header + the request path.
     // The client routes it (arrival host -> configured upstream) and appends
     // the path; the real destination is never carried in a request header.
@@ -254,6 +257,26 @@ fn build_request(inner: &Arc<Inner>, req: &Request<Incoming>) -> HttpRequest {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}:{}", inner.config.host, inner.config.port));
+
+    // Bound-domain validation: when `allowed_hosts` is configured, the request
+    // must arrive on one of the listed hostnames. Requests addressed by IP
+    // (or any unlisted host) are rejected with 403, so callers cannot bypass
+    // the bound domain by hitting the server's IP directly.
+    if !inner.config.allowed_hosts.is_empty() {
+        let hostname = host_name(&host);
+        if hostname.parse::<std::net::IpAddr>().is_ok() {
+            return Err(host_forbidden("Host must be a domain, not an IP"));
+        }
+        let allowed = inner
+            .config
+            .allowed_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&hostname));
+        if !allowed {
+            return Err(host_forbidden(&format!("Host not allowed: {hostname}")));
+        }
+    }
+
     let path = req.uri().path();
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     let url = format!("http://{host}{path}{query}");
@@ -283,17 +306,46 @@ fn build_request(inner: &Arc<Inner>, req: &Request<Incoming>) -> HttpRequest {
 
     log::log(format!("[{}] {}", method, url));
 
-    HttpRequest {
+    Ok(HttpRequest {
         method,
         url,
         header,
         content_length,
+    })
+}
+
+/// Extract the hostname from a `Host` header value (strip the port and any
+/// IPv6 brackets), e.g. "example.com:8080" -> "example.com", "1.2.3.4" -> "1.2.3.4".
+fn host_name(host_header: &str) -> String {
+    let mut h = host_header;
+    // Strip the port (suffix after the last ':' if it is numeric).
+    if let Some(idx) = h.rfind(':') {
+        let after = &h[idx + 1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            h = &h[..idx];
+        }
     }
+    // Strip IPv6 brackets, e.g. "[::1]" -> "::1".
+    h.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string()
+}
+
+/// Build a 403 Forbidden response for a host-validation failure.
+fn host_forbidden(msg: &str) -> Response<Boxed> {
+    log::log(format!("host forbidden: {msg}"));
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Full::new(Bytes::copy_from_slice(msg.as_bytes())).boxed())
+        .unwrap()
 }
 
 /// `/request`: forward an HTTP request through an idle proxy connection.
 async fn handle_request(inner: Arc<Inner>, req: Request<Incoming>) -> Response<Boxed> {
-    let http_req = build_request(&inner, &req);
+    let http_req = match build_request(&inner, &req) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
 
     // No proxy available.
     if inner.pools.lock().unwrap().is_empty() {

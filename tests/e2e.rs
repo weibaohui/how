@@ -306,6 +306,68 @@ fn test_wrong_secret_key() {
 }
 
 #[test]
+fn test_server_allowed_hosts() {
+    // Server bound to the hostname "localhost": requests on that domain are
+    // proxied; requests addressed by IP (or an unlisted host) are rejected 403.
+    let dir = tmpdir();
+    let api_port = free_port();
+    let srv_port = free_port();
+    let api_base = format!("http://127.0.0.1:{api_port}");
+
+    let _api = Proc::spawn(
+        "test_api",
+        &bin("how-test-api"),
+        &["-addr", &format!("127.0.0.1:{api_port}")],
+    );
+
+    let srv_cfg = format!("{dir}/server.cfg");
+    write_cfg(&srv_cfg, &format!(
+        "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\nallowedhosts:\n - localhost\n"
+    ));
+    let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
+    wait_for_server(srv_port);
+
+    // Client routes the arrival host "localhost:<port>" -> test_api.
+    let cli_cfg = format!("{dir}/client.cfg");
+    write_cfg(&cli_cfg, &format!(
+        "---\ntargets:\n - ws://127.0.0.1:{srv_port}/register\npoolidlesize: 2\npoolmaxsize: 100\n\
+         routes:\n  \"localhost:{srv_port}\": \"{api_base}\"\n"
+    ));
+    let _client = Proc::spawn("client", &bin("how-client"), &["--config", &cli_cfg]);
+
+    // Wait until the localhost path is proxied (client registered + route ok).
+    let start = Instant::now();
+    loop {
+        let url = format!("http://localhost:{srv_port}/hello");
+        if let Ok(r) = http().get(&url).send() {
+            if r.status().as_u16() == 200 {
+                break;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("client never registered a usable connection");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Bound domain (localhost) -> proxied -> 200.
+    let resp = http().get(&format!("http://localhost:{srv_port}/hello")).send().unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // IP address -> 403 (cannot bypass the bound domain via IP).
+    let resp = http().get(&format!("http://127.0.0.1:{srv_port}/hello")).send().unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+
+    // Unlisted domain (Host override) -> 403.
+    let resp = http()
+        .get(&format!("http://127.0.0.1:{srv_port}/hello"))
+        .header("host", format!("evil.com:{srv_port}"))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+#[test]
 fn test_pool_saturation_timeout() {
     let dir = tmpdir();
     let api_port = free_port();
