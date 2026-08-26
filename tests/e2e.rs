@@ -368,6 +368,89 @@ fn test_server_allowed_hosts() {
 }
 
 #[test]
+fn test_server_ip_whitelist() {
+    // Server with allowips=["192.0.2.1"] (not localhost) -> all requests from
+    // 127.0.0.1 are denied with "DENY 127.0.0.1".
+    let dir = tmpdir();
+    let srv_port = free_port();
+    let srv_cfg = format!("{dir}/server.cfg");
+    write_cfg(&srv_cfg, &format!(
+        "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\nallowips:\n - 192.0.2.1\n"
+    ));
+    let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
+    wait_for_server(srv_port);
+
+    let resp = http().get(&format!("http://127.0.0.1:{srv_port}/hello")).send().unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    let body = resp.text().unwrap();
+    assert!(body.contains("DENY 127.0.0.1"), "expected DENY, got: {body}");
+
+    // /status is NOT gated (health check still works).
+    let resp = http().get(&format!("http://127.0.0.1:{srv_port}/status")).send().unwrap();
+    assert!(resp.status().is_success());
+}
+
+#[test]
+fn test_server_apikey_validation() {
+    // Server with apikeys=["sk-valid-key-123"].
+    let dir = tmpdir();
+    let api_port = free_port();
+    let srv_port = free_port();
+    let api_base = format!("http://127.0.0.1:{api_port}");
+    let _api = Proc::spawn("test_api", &bin("how-test-api"), &["-addr", &format!("127.0.0.1:{api_port}")]);
+    let srv_cfg = format!("{dir}/server.cfg");
+    write_cfg(&srv_cfg, &format!(
+        "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n\
+         apikeys:\n - sk-valid-key-123\n"
+    ));
+    let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
+    wait_for_server(srv_port);
+    let cli_cfg = format!("{dir}/client.cfg");
+    write_cfg(&cli_cfg, &format!(
+        "---\ntargets:\n - ws://127.0.0.1:{srv_port}/register\npoolidlesize: 2\npoolmaxsize: 100\n\
+         routes:\n  \"127.0.0.1:{srv_port}\": \"{api_base}\"\n"
+    ));
+    let _client = Proc::spawn("client", &bin("how-client"), &["--config", &cli_cfg]);
+    // Wait for the client to register (poll with a valid API key).
+    let start = Instant::now();
+    loop {
+        let resp = http()
+            .get(&format!("http://127.0.0.1:{srv_port}/hello"))
+            .header("Authorization", "Bearer sk-valid-key-123")
+            .send();
+        if let Ok(r) = resp {
+            if r.status().as_u16() == 200 {
+                break;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("client never registered a usable connection");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let url = format!("http://127.0.0.1:{srv_port}/hello");
+
+    // No Authorization header -> 403.
+    let resp = http().get(&url).send().unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    assert!(resp.text().unwrap().contains("Missing"));
+
+    // Wrong key -> 403.
+    let resp = http().get(&url).header("Authorization", "Bearer sk-wrong").send().unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    assert!(resp.text().unwrap().contains("Invalid API key"));
+
+    // Valid key -> 200.
+    let resp = http().get(&url).header("Authorization", "Bearer sk-valid-key-123").send().unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Authentication schemes are case-insensitive.
+    let resp = http().get(&url).header("Authorization", "bearer sk-valid-key-123").send().unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[test]
 fn test_pool_saturation_timeout() {
     let dir = tmpdir();
     let api_port = free_port();
