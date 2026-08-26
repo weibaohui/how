@@ -368,7 +368,9 @@ async fn handle_request(
             .headers()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.trim().to_string()));
+            .and_then(|s| s.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, token)| token.trim().to_string());
         match token {
             Some(t) if inner.config.apikeys.iter().any(|k| k == &t) => {}
             Some(_) => return forbidden("Invalid API key"),

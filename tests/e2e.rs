@@ -444,6 +444,10 @@ fn test_server_apikey_validation() {
     // Valid key -> 200.
     let resp = http().get(&url).header("Authorization", "Bearer sk-valid-key-123").send().unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+
+    // Authentication schemes are case-insensitive.
+    let resp = http().get(&url).header("Authorization", "bearer sk-valid-key-123").send().unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
 }
 
 #[test]
