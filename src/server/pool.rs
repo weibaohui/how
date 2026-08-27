@@ -73,14 +73,16 @@ impl Pool {
             .filter_map(|connection| {
                 let st = connection.status();
                 if st == Status::Idle {
-                    idle += 1;
                     // Liveness: a connection that has received no frame at all
                     // for longer than the liveness timeout is half-open (the
                     // peer or the path is gone). Close it regardless of pool
                     // size so the dispatcher never hands a dead tunnel to a
-                    // request. The 30-second pings + this check detect dead
-                    // links in ~2 minutes instead of waiting for the OS TCP
-                    // keepalive (~2 hours).
+                    // request. This runs BEFORE the `idle` counter so a dead
+                    // link is reaped without inflating the count — otherwise a
+                    // dead link could push a healthy one past `size` and get it
+                    // wrongly closed as excess idle. The 30-second pings +
+                    // this check detect dead links in ~2 minutes instead of
+                    // waiting for the OS TCP keepalive (~2 hours).
                     let last_activity_ms =
                         connection.last_activity().elapsed().as_millis() as i64;
                     if last_activity_ms > self.liveness_timeout_ms {
@@ -89,17 +91,21 @@ impl Pool {
                             connection.pool_id, last_activity_ms
                         ));
                         connection.close();
-                    } else if idle > *self.size.lock().unwrap() {
-                        // Enough idle connections; close this one if it has
-                        // been idle for longer than IdleTimeout.
-                        if let Some(since) = connection.idle_since() {
-                            let elapsed_ms = since.elapsed().as_millis() as i64;
-                            if elapsed_ms > self.idle_timeout_ms {
-                                log::log(format!(
-                                    "Closing excess idle connection from {} (idle for {}ms)",
-                                    connection.pool_id, elapsed_ms
-                                ));
-                                connection.close();
+                    } else {
+                        // Still alive and idle: count it, then close it if it
+                        // is an excess connection that has been idle for
+                        // longer than IdleTimeout.
+                        idle += 1;
+                        if idle > *self.size.lock().unwrap() {
+                            if let Some(since) = connection.idle_since() {
+                                let elapsed_ms = since.elapsed().as_millis() as i64;
+                                if elapsed_ms > self.idle_timeout_ms {
+                                    log::log(format!(
+                                        "Closing excess idle connection from {} (idle for {}ms)",
+                                        connection.pool_id, elapsed_ms
+                                    ));
+                                    connection.close();
+                                }
                             }
                         }
                     }

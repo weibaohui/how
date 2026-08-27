@@ -84,13 +84,18 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.port == 0 {
         config.port = default_port();
     }
-    if config.timeout == 0 {
+    // Treat any non-positive duration as "unset" -> use the default. A bare
+    // `== 0` check would let a negative value through and, for liveness/
+    // idle, immediately reap every idle connection on the first cleaner pass
+    // (`elapsed_ms` is always >= 0 > negative threshold). For `timeout` a
+    // negative would underflow to a ~584-million-year wait.
+    if config.timeout <= 0 {
         config.timeout = default_timeout();
     }
-    if config.idle_timeout == 0 {
+    if config.idle_timeout <= 0 {
         config.idle_timeout = default_idle_timeout();
     }
-    if config.liveness_timeout == 0 {
+    if config.liveness_timeout <= 0 {
         config.liveness_timeout = default_liveness_timeout();
     }
     Ok(config)
