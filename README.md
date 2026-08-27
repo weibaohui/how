@@ -141,6 +141,7 @@ host : 127.0.0.1            # bind address
 port : 8080                 # bind port
 timeout : 1000              # ms to wait for an idle WS tunnel before returning 526
 idletimeout : 60000         # ms before closing excess idle tunnels
+livenesstimeout : 120000    # ms before closing a silent (half-open) idle tunnel
 secretkey : ThisIsASecret   # shared secret; must match every client's secretkey
 ```
 
@@ -148,6 +149,19 @@ The server is a transparent catch-all reverse proxy: **every path except
 `/register` and `/status` is forwarded** to a HOW client. There is no
 caller-provided destination header — the real upstream is resolved by the
 client from its `routes`.
+
+**Keepalive / liveness.** The *client* sends a WebSocket `ping` every 30 s
+(and replies to any incoming ping with a `pong`): the client is the
+dial-out/NAT side, so its periodic outbound traffic is what keeps NAT /
+firewall idle timers from silently dropping a quiet link after a few hours.
+`livenesstimeout` is the *server's* dead-link detector: a tunnel that
+received *no* frame (ping/pong/data) for this long is treated as half-open
+and closed, so the next request is never handed to a dead tunnel. Because
+the client's 30 s pings keep arriving on a live link, this reaps dead links
+in ~2 minutes instead of waiting for the OS TCP keepalive (~2 hours). When a
+tunnel dies, the client's pool connector (runs every 1 s) dials a
+replacement — only the client can re-establish the tunnel, since the server
+cannot dial back into the client's private network.
 
 ### Optional security gatekeepers
 

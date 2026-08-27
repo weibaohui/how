@@ -5,6 +5,7 @@
 //! new client id registers and are garbage-collected by the server cleaner
 //! once empty.
 
+use crate::log;
 use crate::server::connection::{Connection, Status};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -17,6 +18,7 @@ pub struct Pool {
     connections: Mutex<Vec<Arc<Connection>>>,
     idle_tx: mpsc::Sender<Arc<Connection>>,
     idle_timeout_ms: i64,
+    liveness_timeout_ms: i64,
     done: Mutex<bool>,
 }
 
@@ -25,6 +27,7 @@ impl Pool {
         id: String,
         idle_tx: mpsc::Sender<Arc<Connection>>,
         idle_timeout_ms: i64,
+        liveness_timeout_ms: i64,
     ) -> Arc<Self> {
         Arc::new(Pool {
             id,
@@ -32,6 +35,7 @@ impl Pool {
             connections: Mutex::new(Vec::new()),
             idle_tx,
             idle_timeout_ms,
+            liveness_timeout_ms,
             done: Mutex::new(false),
         })
     }
@@ -70,12 +74,31 @@ impl Pool {
                 let st = connection.status();
                 if st == Status::Idle {
                     idle += 1;
-                    if idle > *self.size.lock().unwrap() {
+                    // Liveness: a connection that has received no frame at all
+                    // for longer than the liveness timeout is half-open (the
+                    // peer or the path is gone). Close it regardless of pool
+                    // size so the dispatcher never hands a dead tunnel to a
+                    // request. The 30-second pings + this check detect dead
+                    // links in ~2 minutes instead of waiting for the OS TCP
+                    // keepalive (~2 hours).
+                    let last_activity_ms =
+                        connection.last_activity().elapsed().as_millis() as i64;
+                    if last_activity_ms > self.liveness_timeout_ms {
+                        log::log(format!(
+                            "Reaping half-open connection from {} (no frame for {}ms)",
+                            connection.pool_id, last_activity_ms
+                        ));
+                        connection.close();
+                    } else if idle > *self.size.lock().unwrap() {
                         // Enough idle connections; close this one if it has
                         // been idle for longer than IdleTimeout.
                         if let Some(since) = connection.idle_since() {
                             let elapsed_ms = since.elapsed().as_millis() as i64;
                             if elapsed_ms > self.idle_timeout_ms {
+                                log::log(format!(
+                                    "Closing excess idle connection from {} (idle for {}ms)",
+                                    connection.pool_id, elapsed_ms
+                                ));
                                 connection.close();
                             }
                         }
