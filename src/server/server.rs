@@ -575,7 +575,12 @@ where
         match existing {
             Some(p) => p,
             None => {
-                let p = Pool::new(id.clone(), inner.idle_tx.clone(), inner.config.idle_timeout);
+                let p = Pool::new(
+                    id.clone(),
+                    inner.idle_tx.clone(),
+                    inner.config.idle_timeout,
+                    inner.config.liveness_timeout,
+                );
                 pools.push(p.clone());
                 p
             }

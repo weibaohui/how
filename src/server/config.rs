@@ -16,6 +16,13 @@ pub struct Config {
     pub timeout: i64,
     #[serde(rename = "idletimeout", default = "default_idle_timeout")]
     pub idle_timeout: i64,
+    /// Liveness timeout: an idle connection that has received no frame at all
+    /// (ping/pong/data) for longer than this is considered half-open and is
+    /// closed. Combined with the 30-second ping this detects dead tunnels in
+    /// ~2 minutes instead of waiting for the OS TCP keepalive (~2 hours).
+    /// `0` falls back to the default.
+    #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
+    pub liveness_timeout: i64,
     #[serde(rename = "secretkey", default)]
     pub secret_key: String,
     /// Allowed arrival hostnames (the hostname part of the request's `Host`
@@ -48,6 +55,9 @@ fn default_timeout() -> i64 {
 fn default_idle_timeout() -> i64 {
     60000
 }
+fn default_liveness_timeout() -> i64 {
+    120000
+}
 
 /// Create a new Server config with default values.
 pub fn new_config() -> Config {
@@ -56,6 +66,7 @@ pub fn new_config() -> Config {
         port: default_port(),
         timeout: default_timeout(),
         idle_timeout: default_idle_timeout(),
+        liveness_timeout: default_liveness_timeout(),
         secret_key: String::new(),
         allowed_hosts: Vec::new(),
         allowips: Vec::new(),
@@ -73,11 +84,19 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.port == 0 {
         config.port = default_port();
     }
-    if config.timeout == 0 {
+    // Treat any non-positive duration as "unset" -> use the default. A bare
+    // `== 0` check would let a negative value through and, for liveness/
+    // idle, immediately reap every idle connection on the first cleaner pass
+    // (`elapsed_ms` is always >= 0 > negative threshold). For `timeout` a
+    // negative would underflow to a ~584-million-year wait.
+    if config.timeout <= 0 {
         config.timeout = default_timeout();
     }
-    if config.idle_timeout == 0 {
+    if config.idle_timeout <= 0 {
         config.idle_timeout = default_idle_timeout();
+    }
+    if config.liveness_timeout <= 0 {
+        config.liveness_timeout = default_liveness_timeout();
     }
     Ok(config)
 }

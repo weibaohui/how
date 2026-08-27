@@ -51,6 +51,7 @@ host: 127.0.0.1
 port: $SERVER_PORT
 timeout: 1000
 idletimeout: 60000
+livenesstimeout: 120000
 secretkey: $SECRET
 EOF
   cat > "$dir/client.cfg" <<EOF

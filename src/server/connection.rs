@@ -50,6 +50,10 @@ pub struct Connection {
     pub pool_id: String,
     status: Mutex<Status>,
     idle_since: Mutex<Option<Instant>>,
+    /// Last time any frame was received from the peer. Refreshed by the
+    /// driver on every ping/pong/data frame; read by the pool cleaner to
+    /// detect half-open links (no traffic => the peer or the path is gone).
+    last_activity: Mutex<Instant>,
     write_tx: mpsc::Sender<Message>,
     read_rx: tokio::sync::Mutex<mpsc::Receiver<Message>>,
     cancel: CancellationToken,
@@ -76,6 +80,7 @@ impl Connection {
             pool_id: pool_id.clone(),
             status: Mutex::new(Status::Idle),
             idle_since: Mutex::new(Some(Instant::now())),
+            last_activity: Mutex::new(Instant::now()),
             write_tx,
             read_rx: tokio::sync::Mutex::new(read_rx),
             cancel,
@@ -114,6 +119,13 @@ impl Connection {
     /// Idle-since timestamp (used by the pool cleaner).
     pub fn idle_since(&self) -> Option<Instant> {
         *self.idle_since.lock().unwrap()
+    }
+
+    /// Last time any frame was received from the peer (used by the pool
+    /// cleaner to detect half-open connections). Refreshed on every ping,
+    /// pong, and data frame by the driver.
+    pub fn last_activity(&self) -> Instant {
+        *self.last_activity.lock().unwrap()
     }
 
     /// Notify that this connection is going to be used. Returns false if the
@@ -290,21 +302,29 @@ async fn driver<S>(
             _ = cancel.cancelled() => break,
             msg = stream.next() => {
                 match msg {
-                    Some(Ok(Message::Ping(p))) => {
-                        pending_pong = Some(p);
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) => break,
-                    Some(Ok(m @ Message::Text(_))) | Some(Ok(m @ Message::Binary(_))) => {
-                        // Wild unexpected message if not currently busy.
-                        if !conn.is_busy() {
-                            break;
+                    Some(Ok(m)) => {
+                        // Any frame received (ping/pong/data/close) proves the
+                        // peer and the path are alive; refresh the liveness
+                        // timestamp the cleaner uses to detect half-open links.
+                        *conn.last_activity.lock().unwrap() = Instant::now();
+                        match m {
+                            Message::Ping(p) => {
+                                pending_pong = Some(p);
+                            }
+                            Message::Pong(_) => {}
+                            Message::Close(_) => break,
+                            mm @ (Message::Text(_) | Message::Binary(_)) => {
+                                // Wild unexpected message if not currently busy.
+                                if !conn.is_busy() {
+                                    break;
+                                }
+                                if read_tx.send(mm).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => {}
                         }
-                        if read_tx.send(m).await.is_err() {
-                            break;
-                        }
                     }
-                    Some(Ok(_)) => {}
                     Some(Err(_)) => break,
                     None => break,
                 }
