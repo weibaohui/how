@@ -249,6 +249,14 @@ async fn driver<S>(
 /// client would hold a pool full of dead connections and never reconnect
 /// (while the server reaps its side and reports "no proxy available").
 ///
+/// Only **Idle** connections are reaped: a Running connection is actively
+/// proxying a request and is demonstrably alive. During a long streamed
+/// response the shared write queue can stay full (dropping pings via
+/// `try_send`), and the server only pongs in response to a ping, so
+/// `last_activity` is not refreshed mid-response — reaping then would break an
+/// in-flight request (the streaming-LLM backpressure case). This mirrors the
+/// server, which only liveness-reaps Idle (not Busy) connections.
+///
 /// `check_interval` is how often the loop wakes to run the liveness check
 /// (and maybe send a ping); `ping_interval` is the cadence of pings.
 /// Production passes 10s / 30s; tests pass tiny values for speed.
@@ -270,8 +278,20 @@ async fn keepalive_loop(
                 // pool connector (runs every 1s) dials a replacement. This is
                 // the authoritative reaper — it must not be delayed by a
                 // backed-up ping send, so the ping below is best-effort.
+                //
+                // Only reap IDLE connections: a Running connection is
+                // actively proxying a request (exchanging data right now),
+                // so it is demonstrably alive. During a long streamed
+                // response the shared write queue can stay full, dropping
+                // keepalive pings (try_send below); since the server only
+                // pongs in response to a ping it never proactively sends, no
+                // pong refreshes `last_activity`. Reaping such a connection
+                // mid-response would break an in-flight request — exactly the
+                // streaming-LLM backpressure case. Mirrors the server, which
+                // only liveness-reaps Idle (not Busy) connections.
+                let st = conn.status();
                 let idle = conn.last_activity().elapsed();
-                if idle > liveness_timeout {
+                if st == Status::Idle && idle > liveness_timeout {
                     log::log(format!(
                         "Reaping half-open tunnel: no frame from server for {}ms",
                         idle.as_millis()
@@ -281,10 +301,12 @@ async fn keepalive_loop(
                 }
                 // Send a keepalive ping at the ping interval. Non-blocking:
                 // if the write channel is full (the driver is wedged on a
-                // dead link's send buffer) we just skip this ping — the
-                // liveness check above will reap shortly anyway. This keeps
-                // the keepalive task responsive so it never stops running the
-                // liveness check.
+                // dead link's send buffer, or a streamed response is filling
+                // it) we just skip this ping. On a dead IDLE link the
+                // liveness check above reaps shortly; on a live RUNNING link
+                // the data exchange itself keeps the peer alive and the Idle
+                // gate prevents a false reap. This keeps the keepalive task
+                // responsive so it never stops running the liveness check.
                 if Instant::now() >= next_ping {
                     match write_tx.try_send(Message::Ping(Vec::new().into())) {
                         Ok(()) => next_ping = Instant::now() + ping_interval,
@@ -716,6 +738,50 @@ mod tests {
 
         handle.abort();
         refresher.abort();
+        cancel.cancel();
+    }
+
+    /// A connection that is RUNNING (actively proxying a request) is NOT
+    /// reaped even if `last_activity` is stale. During a long streamed
+    /// response the shared write queue can stay full, dropping keepalive
+    /// pings; the server only pongs in response to a ping, so no pong
+    /// refreshes `last_activity`. Reaping then would break an in-flight
+    /// request — so the reaper only applies to Idle connections (mirroring
+    /// the server, which only liveness-reaps Idle, not Busy, connections).
+    #[tokio::test(flavor = "current_thread")]
+    async fn keepalive_never_reaps_running_tunnel() {
+        let pool = dummy_pool();
+        let conn = Connection::new(Arc::downgrade(&pool));
+        let cancel = conn.cancel.clone();
+        // A capped channel that we NEVER drain, so pings are dropped on every
+        // `try_send` (Full) — simulating a streamed response backpressuring the
+        // shared write queue. No pong ever comes back, so `last_activity` only
+        // grows.
+        let (write_tx, _rx) = mpsc::channel::<Message>(8);
+        conn.set_status(Status::Running);
+
+        let handle = tokio::spawn(keepalive_loop(
+            conn.clone(),
+            write_tx,
+            cancel.clone(),
+            // liveness (30ms) < check (20ms)*several; many wake-ups pass with a
+            // stale last_activity while Running.
+            Duration::from_millis(30),
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        ));
+
+        // Run well past several liveness timeouts. The connection must stay
+        // alive because it is Running (an in-flight request).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            conn.status(),
+            Status::Running,
+            "a Running (in-flight) tunnel must never be reaped, even with a \
+             stale last_activity and a full write queue"
+        );
+
+        handle.abort();
         cancel.cancel();
     }
 }
