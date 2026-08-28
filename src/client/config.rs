@@ -1,19 +1,22 @@
 //! Client configuration.
 
+use crate::client::connection::PING_INTERVAL_MS;
 use crate::common::Rule;
 use crate::log;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Minimum sane `livenesstimeout` (ms). The client judges liveness by pong
-/// arrival, and pongs only come in response to the 30s keepalive ping (the
-/// server never pongs proactively). A timeout below ~2x the ping interval
-/// cannot reliably observe two pongs, so on a healthy idle link the gap
-/// between pongs (~30s) would already exceed it and the reaper would
-/// false-reap live connections — draining and churning the whole pool.
-/// Any configured value below this floor falls back to the default (and logs
-/// a warning), so a too-small value degrades to "safe" instead of "broken".
-const MIN_LIVENESS_TIMEOUT_MS: i64 = 60_000;
+/// Minimum sane `livenesstimeout` (ms), derived from the keepalive ping
+/// interval (`PING_INTERVAL_MS` in `connection.rs` — change them together).
+/// The client judges liveness by pong arrival, and pongs only come in
+/// response to the keepalive ping (the server never pongs proactively). A
+/// timeout below ~2x the ping interval cannot reliably observe two pongs, so
+/// on a healthy idle link the gap between pongs (~30s) would already exceed
+/// it and the reaper would false-reap live connections — draining and
+/// churning the whole pool. Any configured value below this floor falls back
+/// to the default (and logs a warning), so a too-small value degrades to
+/// "safe" instead of "broken".
+const MIN_LIVENESS_TIMEOUT_MS: i64 = 2 * PING_INTERVAL_MS;
 
 /// Configures a WSP client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -115,9 +118,12 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
         // churning the pool. Clamp to the default and warn so the operator
         // knows their value was overridden.
         log::log(format!(
-            "livenesstimeout {}ms is below the minimum {}ms (must exceed ~2x the 30s ping \
+            "livenesstimeout {}ms is below the minimum {}ms (must exceed ~2x the {}ms ping \
              interval: pongs only arrive in response to a ping); falling back to default {}ms",
-            config.liveness_timeout, MIN_LIVENESS_TIMEOUT_MS, default_liveness_timeout()
+            config.liveness_timeout,
+            MIN_LIVENESS_TIMEOUT_MS,
+            PING_INTERVAL_MS,
+            default_liveness_timeout()
         ));
         config.liveness_timeout = default_liveness_timeout();
     }

@@ -18,6 +18,17 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
 
+/// Keepalive cadence: how often the keepalive task wakes to run the liveness
+/// check (and maybe send a ping).
+pub(crate) const CHECK_INTERVAL_MS: i64 = 10_000;
+
+/// Keepalive ping interval: periodic outbound pings keep NAT/firewall idle
+/// timers from dropping a quiet link, and the pongs they elicit are what the
+/// liveness check measures. The config-side floor
+/// (`MIN_LIVENESS_TIMEOUT_MS` in `config.rs`) is derived from this, so the
+/// two must change together.
+pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
+
 /// Status of a client connection. Mirrors Go's `CONNECTING/IDLE/RUNNING` iota,
 /// with an extra `Closed` for idempotent shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,8 +157,8 @@ impl Connection {
             write_tx,
             cancel,
             liveness_timeout,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
+            Duration::from_millis(CHECK_INTERVAL_MS as u64),
+            Duration::from_millis(PING_INTERVAL_MS as u64),
         ));
 
         Ok(())
