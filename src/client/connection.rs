@@ -303,12 +303,20 @@ async fn keepalive_loop(
                 let st = conn.status();
                 let idle = conn.last_activity().elapsed();
                 if st == Status::Idle && idle > liveness_timeout {
-                    log::log(format!(
-                        "Reaping half-open tunnel: no frame from server for {}ms",
-                        idle.as_millis()
-                    ));
-                    conn.shutdown();
-                    break;
+                    // 重检 status：读取 status/last_activity 与 shutdown 之间，
+                    // serve 循环可能刚好从 read_rx 取到一个请求并把 status
+                    // 切到 Running（driver 收到该帧时已刷新了 last_activity，
+                    // 但 keepalive 用的可能是刷新前的旧值）。重检可显著缩小
+                    // 这个 TOCTOU 窗口，避免误杀正在处理的请求。窗口无法
+                    // 完全消除（除非在持锁状态下决策），但此重检已足够。
+                    if conn.status() == Status::Idle {
+                        log::log(format!(
+                            "Reaping half-open tunnel: no frame from server for {}ms",
+                            idle.as_millis()
+                        ));
+                        conn.shutdown();
+                        break;
+                    }
                 }
                 // Send a keepalive ping at the ping interval. Non-blocking:
                 // if the write channel is full (the driver is wedged on a
