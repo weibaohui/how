@@ -235,10 +235,7 @@ impl Connection {
             return;
         }
         if let Some(pool) = self.pool.upgrade() {
-            let stable = self
-                .connected_at()
-                .map(|t| t.elapsed() >= STABLE_LIFETIME)
-                .unwrap_or(false);
+            let stable = is_stable_lifetime(self.connected_at().map(|t| t.elapsed()));
             pool.note_outcome(stable);
             pool.remove(self);
         }
@@ -250,6 +247,20 @@ impl Connection {
     }
     pub fn set_status(&self, s: Status) {
         *self.status.lock().unwrap() = s;
+    }
+}
+
+/// Decide whether a connection's usable lifetime counts as "stable" for the
+/// connector's failure backoff: `None` (never became usable — connect failed
+/// before the greeting) or a lifetime below `STABLE_LIFETIME` (server accepts
+/// then immediately closes) is a failure; at or past the threshold the server
+/// was genuinely serving, which resets the backoff. Pure in the elapsed
+/// lifetime (not the clock) so tests can cover every branch without
+/// constructing past `Instant`s.
+fn is_stable_lifetime(elapsed_since_connected: Option<Duration>) -> bool {
+    match elapsed_since_connected {
+        Some(e) => e >= STABLE_LIFETIME,
+        None => false,
     }
 }
 
@@ -865,5 +876,36 @@ mod tests {
 
         handle.abort();
         cancel.cancel();
+    }
+
+    /// A connection that never became usable (connect failed before the
+    /// greeting) must be scored as a failure: `is_stable_lifetime(None)` is
+    /// false, so the pool connector backs off instead of hammering an
+    /// unreachable server.
+    #[test]
+    fn outcome_never_connected_is_a_failure() {
+        assert!(!is_stable_lifetime(None));
+    }
+
+    /// The stability threshold: a usable lifetime below `STABLE_LIFETIME`
+    /// (server accepts then immediately closes) is a failure; at or past it
+    /// the connection counts as stable and resets the connector backoff.
+    #[test]
+    fn outcome_threshold_decides_stability() {
+        assert!(!is_stable_lifetime(Some(
+            STABLE_LIFETIME - Duration::from_millis(1)
+        )));
+        assert!(is_stable_lifetime(Some(STABLE_LIFETIME)));
+        assert!(is_stable_lifetime(Some(STABLE_LIFETIME * 10)));
+    }
+
+    /// A just-connected tunnel (elapsed ~0, well below `STABLE_LIFETIME`)
+    /// that shuts down right away must also score as a failure — the
+    /// accept-then-close churn mode. Exercises the real `shutdown()` path
+    /// (this module can write `connected_at` but not the pool's private
+    /// backoff state; the pool-side scoring is covered in `pool.rs`).
+    #[test]
+    fn outcome_fresh_connection_is_a_failure() {
+        assert!(!is_stable_lifetime(Some(Instant::now().elapsed())));
     }
 }

@@ -69,6 +69,12 @@ impl Pool {
         let mut failures = self.failures.lock().unwrap();
         let mut backoff = self.backoff_until.lock().unwrap();
         if ok {
+            // Only log the recovery when there was actually a backoff to
+            // clear — every healthy long-lived close calls this too, and
+            // those must stay silent.
+            if *failures > 0 || backoff.is_some() {
+                log::log("Stable connection: connector backoff cleared".to_string());
+            }
             *failures = 0;
             *backoff = None;
             return;
@@ -78,6 +84,12 @@ impl Pool {
         let shift = (*failures).min(6);
         let secs = (1u64 << shift).min(MAX_BACKOFF.as_secs());
         *backoff = Some(Instant::now() + Duration::from_secs(secs));
+        // One line per failure event: while backing off the connector dials
+        // at the backoff cadence (not 1s), so this is naturally low-noise
+        // and makes the backoff observable in the field.
+        log::log(format!(
+            "Connection failure #{failures}: backing off {secs}s before the next dial"
+        ));
     }
 
     /// Whether the connector is currently backing off (should not dial). The
@@ -89,7 +101,6 @@ impl Pool {
             None => false,
         }
     }
-
 
     /// Start the pool: connect once, then refresh every second.
     pub fn start(self: Arc<Self>) {
@@ -309,6 +320,22 @@ mod tests {
         pool.note_outcome(false); // failures=3
         pool.note_outcome(true); // reset -> 0
         pool.note_outcome(false); // failures=1 again
+        assert_eq!(failures(&pool), 1);
+        assert!(pool.in_backoff());
+    }
+
+    /// 验证 `Connection::shutdown()` 的打分接线（打分逻辑在
+    /// `connection.rs::is_stable_lifetime`，此处测真实链路）：从未完成
+    /// 握手的连接（connect 阶段失败，`connected_at` 为 None）关闭时必须
+    /// 向池子记一次失败并进入退避；幂等保护确保重复 shutdown 不会重复记分。
+    /// 只有 pool 模块的测试能读到私有的 failures/backoff 状态，故此测试
+    /// 放在这里。
+    #[test]
+    fn shutdown_scores_never_connected_failure_once() {
+        let pool = dummy_pool();
+        let conn = crate::client::connection::Connection::new(Arc::downgrade(&pool));
+        conn.shutdown();
+        conn.shutdown(); // idempotent: must not double-score
         assert_eq!(failures(&pool), 1);
         assert!(pool.in_backoff());
     }
