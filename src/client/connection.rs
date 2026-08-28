@@ -29,6 +29,21 @@ pub(crate) const CHECK_INTERVAL_MS: i64 = 10_000;
 /// two must change together.
 pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
 
+/// A connection that lived past this long since a successful handshake counts
+/// as "stable" for the connector's failure backoff: its end resets the backoff.
+/// A connection that dies sooner (or never handshaked) counts as a failure —
+/// covers both "server unreachable" (connect error) and "server accepts then
+/// immediately closes" (handshake ok, dies in ~1s). 10s comfortably exceeds
+/// the sub-second "accept-then-close" churn while staying well under the
+/// keepalive liveness window, so a genuinely usable tunnel is never miscounted
+/// as a failure.
+const STABLE_LIFETIME: Duration = Duration::from_secs(10);
+
+/// 建立连接各阶段（TCP 拨号 / WebSocket 握手 / greeting 发送）的超时上限。
+/// 任一阶段超过该时间即判定失败：否则对端无响应时 `connect()` 会永久挂起，
+/// `Connecting` 状态的连接将一直占用池容量，池子再也无法补充新连接。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Status of a client connection. Mirrors Go's `CONNECTING/IDLE/RUNNING` iota,
 /// with an extra `Closed` for idempotent shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +65,11 @@ pub struct Connection {
     /// arrives within ~RTT of each ping. If nothing arrives for
     /// `liveness_timeout`, the tunnel is dead and must be re-established.
     last_activity: Mutex<Instant>,
+    /// When the tunnel became usable (handshake + greeting succeeded). `None`
+    /// until then (or if connect failed before then). Used by `shutdown()` to
+    /// tell a stable connection from one the server accepted then immediately
+    /// closed, which drives the pool connector's failure backoff.
+    connected_at: Mutex<Option<Instant>>,
     cancel: CancellationToken,
     self_weak: Weak<Connection>,
 }
@@ -61,6 +81,7 @@ impl Connection {
             pool,
             status: Mutex::new(Status::Connecting),
             last_activity: Mutex::new(Instant::now()),
+            connected_at: Mutex::new(None),
             cancel: CancellationToken::new(),
             self_weak: weak.clone(),
         })
@@ -70,6 +91,12 @@ impl Connection {
     /// task to detect half-open links).
     fn last_activity(&self) -> Instant {
         *self.last_activity.lock().unwrap()
+    }
+
+    /// When the tunnel became usable, if ever (used by `shutdown` to score the
+    /// connection's lifecycle for the connector backoff).
+    fn connected_at(&self) -> Option<Instant> {
+        *self.connected_at.lock().unwrap()
     }
 
     /// Dial the server and, on success, spawn the driver, serve and keepalive
@@ -104,13 +131,28 @@ impl Connection {
         }
         let host = req.uri().host().unwrap_or("127.0.0.1").to_string();
         let port = req.uri().port_u16().unwrap_or(80);
-        let stream = tokio::net::TcpStream::connect((host.as_str(), port))
-            .await
-            .map_err(|e| format!("{}", e))?;
+        // TCP 拨号套上超时：SYN 被丢弃（如防火墙静默丢包）时不会永久挂起。
+        let stream = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| format!("dial timeout after {}s", CONNECT_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("{}", e))?;
         let _ = stream.set_nodelay(true);
-        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
-            .await
-            .map_err(|e| format!("{}", e))?;
+        // WebSocket 握手同样限时：对端接受 TCP 却不回 101 时不能无限等待。
+        let (ws, _resp) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::client_async(req, stream),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "websocket handshake timeout after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("{}", e))?;
 
         log::log(format!("Connected to {}", target));
 
@@ -121,10 +163,20 @@ impl Connection {
         let (write_tx, write_rx) = mpsc::channel::<Message>(8);
 
         let mut ws = ws;
-        if ws.send(Message::text(greeting)).await.is_err() {
+        // greeting 发送也限时：握手后对端不消费数据时同样不能永久挂起。
+        let greeted = tokio::time::timeout(CONNECT_TIMEOUT, ws.send(Message::text(greeting)))
+            .await
+            .map_err(|_| format!("greeting timeout after {}s", CONNECT_TIMEOUT.as_secs()))
+            .and_then(|r| r.map_err(|_| "greeting error".to_string()));
+        if let Err(e) = greeted {
             self.shutdown();
-            return Err("greeting error".to_string());
+            return Err(e);
         }
+        // Handshake + greeting succeeded: mark when the tunnel became usable.
+        // `shutdown()` uses the elapsed-since to tell a stable connection from
+        // one the server accepted then immediately closed, which drives the
+        // pool connector's failure backoff.
+        *self.connected_at.lock().unwrap() = Some(Instant::now());
 
         let this = match self.self_weak.upgrade() {
             Some(a) => a,
@@ -166,6 +218,12 @@ impl Connection {
 
     /// Close the connection: cancel the driver/serve/ping and remove it from
     /// the pool. Idempotent.
+    ///
+    /// Also scores the connection's lifecycle into the pool connector's failure
+    /// backoff: a connection that never handshaked (connect error) or that
+    /// died within `STABLE_LIFETIME` of becoming usable (server accepts then
+    /// immediately closes) counts as a failure and grows the backoff; one that
+    /// lived past `STABLE_LIFETIME` counts as a success and resets it.
     pub fn shutdown(&self) {
         let already = {
             let mut s = self.status.lock().unwrap();
@@ -176,10 +234,12 @@ impl Connection {
         if already {
             return;
         }
-        self.cancel.cancel();
         if let Some(pool) = self.pool.upgrade() {
+            let stable = is_stable_lifetime(self.connected_at().map(|t| t.elapsed()));
+            pool.note_outcome(stable);
             pool.remove(self);
         }
+        self.cancel.cancel();
     }
 
     pub fn status(&self) -> Status {
@@ -187,6 +247,20 @@ impl Connection {
     }
     pub fn set_status(&self, s: Status) {
         *self.status.lock().unwrap() = s;
+    }
+}
+
+/// Decide whether a connection's usable lifetime counts as "stable" for the
+/// connector's failure backoff: `None` (never became usable — connect failed
+/// before the greeting) or a lifetime below `STABLE_LIFETIME` (server accepts
+/// then immediately closes) is a failure; at or past the threshold the server
+/// was genuinely serving, which resets the backoff. Pure in the elapsed
+/// lifetime (not the clock) so tests can cover every branch without
+/// constructing past `Instant`s.
+fn is_stable_lifetime(elapsed_since_connected: Option<Duration>) -> bool {
+    match elapsed_since_connected {
+        Some(e) => e >= STABLE_LIFETIME,
+        None => false,
     }
 }
 
@@ -802,5 +876,36 @@ mod tests {
 
         handle.abort();
         cancel.cancel();
+    }
+
+    /// A connection that never became usable (connect failed before the
+    /// greeting) must be scored as a failure: `is_stable_lifetime(None)` is
+    /// false, so the pool connector backs off instead of hammering an
+    /// unreachable server.
+    #[test]
+    fn outcome_never_connected_is_a_failure() {
+        assert!(!is_stable_lifetime(None));
+    }
+
+    /// The stability threshold: a usable lifetime below `STABLE_LIFETIME`
+    /// (server accepts then immediately closes) is a failure; at or past it
+    /// the connection counts as stable and resets the connector backoff.
+    #[test]
+    fn outcome_threshold_decides_stability() {
+        assert!(!is_stable_lifetime(Some(
+            STABLE_LIFETIME - Duration::from_millis(1)
+        )));
+        assert!(is_stable_lifetime(Some(STABLE_LIFETIME)));
+        assert!(is_stable_lifetime(Some(STABLE_LIFETIME * 10)));
+    }
+
+    /// A just-connected tunnel (elapsed ~0, well below `STABLE_LIFETIME`)
+    /// that shuts down right away must also score as a failure — the
+    /// accept-then-close churn mode. Exercises the real `shutdown()` path
+    /// (this module can write `connected_at` but not the pool's private
+    /// backoff state; the pool-side scoring is covered in `pool.rs`).
+    #[test]
+    fn outcome_fresh_connection_is_a_failure() {
+        assert!(!is_stable_lifetime(Some(Instant::now().elapsed())));
     }
 }
