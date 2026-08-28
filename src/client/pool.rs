@@ -75,7 +75,7 @@ impl Pool {
         }
         *failures = failures.saturating_add(1);
         // 1<<1=2, 1<<2=4, 1<<3=8, 1<<4=16, 1<<5=32, 1<<6=64 -> cap 60.
-        let shift = (*failures).min(6) as u32;
+        let shift = (*failures).min(6);
         let secs = (1u64 << shift).min(MAX_BACKOFF.as_secs());
         *backoff = Some(Instant::now() + Duration::from_secs(secs));
     }
@@ -167,7 +167,10 @@ impl Pool {
     /// Shutdown close all connection in the pool.
     pub fn shutdown(&self) {
         self.done.cancel();
-        let conns = self.connections.lock().unwrap();
+        // 先克隆连接列表并在语句末尾释放锁：下方 `conn.shutdown()` 会回调
+        // `pool.remove()` 重新获取同一把 `std::sync::Mutex`，若持锁迭代，
+        // 同一线程重入不可重入的互斥锁会永久阻塞（死锁）。
+        let conns = self.connections.lock().unwrap().clone();
         for conn in conns.iter() {
             conn.shutdown();
         }
@@ -211,6 +214,7 @@ mod tests {
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
+    /// 构造一个指向不可达地址的测试用连接池（不发起真实拨号）。
     fn dummy_pool() -> Arc<Pool> {
         let config = Arc::new(new_config());
         let inner = Arc::new(ClientInner {
@@ -225,10 +229,12 @@ mod tests {
         )
     }
 
+    /// 读取当前连续失败次数（测试辅助）。
     fn failures(p: &Pool) -> u32 {
         *p.failures.lock().unwrap()
     }
 
+    /// 验证连续失败会指数级拉长退避并阻断连接器，且退避封顶在 60 秒。
     #[test]
     fn failure_grows_backoff_and_blocks_connector() {
         let pool = dummy_pool();
@@ -260,6 +266,7 @@ mod tests {
         );
     }
 
+    /// 验证一条稳定连接会把失败计数清零并解除连接器的退避阻断。
     #[test]
     fn stable_connection_resets_backoff() {
         let pool = dummy_pool();
@@ -274,6 +281,7 @@ mod tests {
         assert!(!pool.in_backoff());
     }
 
+    /// 验证退避期间 `connector()` 完全不动池子（不新增 Connecting 条目）。
     #[test]
     fn connector_is_noop_while_backing_off() {
         // While in backoff, connector() must not touch the pool (no new
@@ -290,6 +298,7 @@ mod tests {
         );
     }
 
+    /// 验证退避被稳定连接重置后，下一次失败从 2 秒重新开始而非延续旧计数。
     #[test]
     fn failures_restart_after_reset() {
         // After a stable connection resets the counter, the next failure starts

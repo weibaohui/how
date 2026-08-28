@@ -39,6 +39,11 @@ pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
 /// as a failure.
 const STABLE_LIFETIME: Duration = Duration::from_secs(10);
 
+/// 建立连接各阶段（TCP 拨号 / WebSocket 握手 / greeting 发送）的超时上限。
+/// 任一阶段超过该时间即判定失败：否则对端无响应时 `connect()` 会永久挂起，
+/// `Connecting` 状态的连接将一直占用池容量，池子再也无法补充新连接。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Status of a client connection. Mirrors Go's `CONNECTING/IDLE/RUNNING` iota,
 /// with an extra `Closed` for idempotent shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,13 +131,28 @@ impl Connection {
         }
         let host = req.uri().host().unwrap_or("127.0.0.1").to_string();
         let port = req.uri().port_u16().unwrap_or(80);
-        let stream = tokio::net::TcpStream::connect((host.as_str(), port))
-            .await
-            .map_err(|e| format!("{}", e))?;
+        // TCP 拨号套上超时：SYN 被丢弃（如防火墙静默丢包）时不会永久挂起。
+        let stream = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| format!("dial timeout after {}s", CONNECT_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("{}", e))?;
         let _ = stream.set_nodelay(true);
-        let (ws, _resp) = tokio_tungstenite::client_async(req, stream)
-            .await
-            .map_err(|e| format!("{}", e))?;
+        // WebSocket 握手同样限时：对端接受 TCP 却不回 101 时不能无限等待。
+        let (ws, _resp) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::client_async(req, stream),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "websocket handshake timeout after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("{}", e))?;
 
         log::log(format!("Connected to {}", target));
 
@@ -143,9 +163,14 @@ impl Connection {
         let (write_tx, write_rx) = mpsc::channel::<Message>(8);
 
         let mut ws = ws;
-        if ws.send(Message::text(greeting)).await.is_err() {
+        // greeting 发送也限时：握手后对端不消费数据时同样不能永久挂起。
+        let greeted = tokio::time::timeout(CONNECT_TIMEOUT, ws.send(Message::text(greeting)))
+            .await
+            .map_err(|_| format!("greeting timeout after {}s", CONNECT_TIMEOUT.as_secs()))
+            .and_then(|r| r.map_err(|_| "greeting error".to_string()));
+        if let Err(e) = greeted {
             self.shutdown();
-            return Err("greeting error".to_string());
+            return Err(e);
         }
         // Handshake + greeting succeeded: mark when the tunnel became usable.
         // `shutdown()` uses the elapsed-since to tell a stable connection from
