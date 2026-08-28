@@ -154,14 +154,30 @@ client from its `routes`.
 (and replies to any incoming ping with a `pong`): the client is the
 dial-out/NAT side, so its periodic outbound traffic is what keeps NAT /
 firewall idle timers from silently dropping a quiet link after a few hours.
-`livenesstimeout` is the *server's* dead-link detector: a tunnel that
-received *no* frame (ping/pong/data) for this long is treated as half-open
-and closed, so the next request is never handed to a dead tunnel. Because
-the client's 30 s pings keep arriving on a live link, this reaps dead links
-in ~2 minutes instead of waiting for the OS TCP keepalive (~2 hours). When a
-tunnel dies, the client's pool connector (runs every 1 s) dials a
-replacement — only the client can re-establish the tunnel, since the server
-cannot dial back into the client's private network.
+
+Liveness is checked on **both** ends, because a ping that never gets a pong
+means the peer or the path is gone — and a half-open link can die without a
+TCP FIN/RST ever reaching either side (a NAT/firewall just drops the
+4-tuple silently), so neither a missing close nor OS TCP keepalive (off by
+default, and dormant whenever the 30 s pings keep the socket non-idle) can
+rely on detecting it:
+
+- **Server side** (`livenesstimeout`, default 120 s): a tunnel that received
+  *no* frame (ping/pong/data) for this long is treated as half-open and
+  closed, so the next request is never handed to a dead tunnel. When a
+  tunnel dies, this reaps dead links in ~2 minutes instead of waiting for the
+  OS TCP keepalive (~2 hours).
+- **Client side** (`livenesstimeout` on the client, default 90 s): the client
+  tracks `last_activity` (refreshed on every received pong/data frame) and
+  closes a tunnel that has been silent for longer than the timeout, then the
+  pool connector (runs every 1 s) dials a replacement — only the client can
+  re-establish the tunnel, since the server cannot dial back into the
+  client's private network. The client's timeout (90 s) is shorter than the
+  server's (120 s) on purpose, so the client reconnects *before* the server
+  reaps and removes the whole pool. **Without this client-side check the
+  client would hold a pool full of dead, half-open tunnels forever and the
+  server would report "no proxy available" the next morning** — exactly the
+  "works all day, dead overnight" symptom.
 
 ### Optional security gatekeepers
 
@@ -200,6 +216,7 @@ targets :                            # HOW servers to dial out to
  - ws://127.0.0.1:8080/register
 poolidlesize : 10                    # idle WS tunnels kept warm per server
 poolmaxsize : 100                    # max concurrent WS tunnels per server
+livenesstimeout : 90000              # ms before a silent tunnel is reaped & reconnected
 secretkey : ThisIsASecret            # must match the server's secretkey
 
 # Route map: arrival host (the Host the caller targets on the server)
@@ -217,6 +234,7 @@ routes :
 | `targets` | One or more `/register` URLs to dial out to. The client opens a connection pool to each. |
 | `poolidlesize` | Idle tunnels kept warm per server. Raises it for low-latency first byte. |
 | `poolmaxsize` | Hard cap on concurrent tunnels per server. Size to your peak concurrency; beyond it the server waits up to `timeout` ms then returns 526. |
+| `livenesstimeout` | ms before a tunnel that has received no frame (pong/data) is closed as half-open and reconnected. Default 90000 (90 s, < the server's 120 s, so the client self-heals before the server reaps the pool). 0 = default. |
 | `secretkey` | Sent as `X-SECRET-KEY` on the WebSocket handshake. Must equal the server's `secretkey` or the tunnel is rejected (→ 526). |
 | `routes` | The **arrival host → upstream base** map. The arrival host is the `Host` the caller targets on the server (`127.0.0.1:8080`, `llm.example.com`). The client appends the request path + query to the upstream base. Matching tries `host:port` first, then `host`. |
 | `id` | Optional client id; a random UUID is generated on startup if omitted. |

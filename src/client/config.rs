@@ -15,6 +15,20 @@ pub struct Config {
     pub pool_idle_size: i64,
     #[serde(rename = "poolmaxsize", default = "default_pool_max_size")]
     pub pool_max_size: i64,
+    /// Liveness timeout: an idle tunnel that has received no frame at all
+    /// (pong/data) from the server for longer than this is considered
+    /// half-open (the peer or the path is gone) and is closed so the pool
+    /// connector dials a replacement. The client sends a ping every 30s, so
+    /// on a live link a pong arrives ~every 30s. The default (90s = 3 ping
+    /// periods) tolerates a couple of missed pongs while still reaping dead
+    /// links well before the server's `livenesstimeout` (default 120s), so
+    /// the client reconnects proactively and the pool stays warm overnight.
+    /// Sending pings without verifying pongs cannot detect dead links, so
+    /// without this the client would hold a pool of dead connections and the
+    /// server would report "no proxy available" after an idle night.
+    /// `0` falls back to the default.
+    #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
+    pub liveness_timeout: i64,
     #[serde(default)]
     pub whitelist: Vec<Rule>,
     #[serde(default)]
@@ -42,6 +56,9 @@ fn default_pool_idle_size() -> i64 {
 fn default_pool_max_size() -> i64 {
     100
 }
+fn default_liveness_timeout() -> i64 {
+    90000
+}
 
 /// Create a new client config with default values (including a fresh UUID).
 pub fn new_config() -> Config {
@@ -50,6 +67,7 @@ pub fn new_config() -> Config {
         targets: default_targets(),
         pool_idle_size: default_pool_idle_size(),
         pool_max_size: default_pool_max_size(),
+        liveness_timeout: default_liveness_timeout(),
         whitelist: Vec::new(),
         blacklist: Vec::new(),
         secret_key: String::new(),
@@ -72,6 +90,13 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     }
     if config.pool_max_size == 0 {
         config.pool_max_size = default_pool_max_size();
+    }
+    // Treat a non-positive duration as "unset" -> use the default. A bare
+    // `== 0` check would let a negative value through and immediately reap
+    // every idle connection on the first keepalive pass (`elapsed` is always
+    // >= 0 > a negative threshold), silently killing the whole pool.
+    if config.liveness_timeout <= 0 {
+        config.liveness_timeout = default_liveness_timeout();
     }
     for rule in config.whitelist.iter_mut() {
         rule.compile().map_err(|e| e.to_string())?;
