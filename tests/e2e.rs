@@ -70,9 +70,15 @@ fn write_cfg(path: &str, contents: &str) {
 
 fn wait_for_server(port: u16) {
     let url = format!("http://127.0.0.1:{port}/status");
+    // 本地闭环测试必须禁用代理：环境变量（如 HTTP_PROXY）中的代理会
+    // 劫持请求，导致健康检查探测不到本机刚启动的 server。
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
     let start = Instant::now();
     loop {
-        if let Ok(resp) = reqwest::blocking::get(&url) {
+        if let Ok(resp) = client.get(&url).send() {
             if resp.status().is_success() {
                 return;
             }
@@ -88,9 +94,14 @@ fn wait_for_server(port: u16) {
 /// route working).
 fn wait_for_proxy(server_port: u16) {
     let url = format!("http://127.0.0.1:{server_port}/hello");
+    // 同 wait_for_server：禁用环境代理，确保请求直达本机被测进程。
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
     let start = Instant::now();
     loop {
-        let resp = reqwest::blocking::Client::new().get(&url).send();
+        let resp = client.get(&url).send();
         if let Ok(r) = resp {
             if r.status().as_u16() == 200 {
                 return;
@@ -103,11 +114,20 @@ fn wait_for_proxy(server_port: u16) {
     }
 }
 
+/// 为每个测试创建独立的临时目录。
+///
+/// 目录名在进程 PID 之外追加自增序号：同一测试二进制内多个 `#[test]`
+/// 并行运行且共享同一进程 ID，若共用同一目录会互相覆盖 `server.cfg` /
+/// `client.cfg`，导致子进程读到错误配置、绑错端口甚至启动失败，
+/// 最终 `wait_for_server` 健康检查超时。
 fn tmpdir() -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
     let d = format!(
-        "{}/wsp-e2e-{}",
+        "{}/wsp-e2e-{}-{}",
         std::env::temp_dir().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
     );
     let _ = std::fs::create_dir_all(&d);
     d
@@ -122,8 +142,11 @@ fn bin(name: &str) -> String {
 }
 
 fn http() -> reqwest::blocking::Client {
+    // 禁用环境代理（如 HTTP_PROXY）：本机代理会按 Host 规则劫持请求，
+    // 例如携带伪造 Host 的边界测试请求会被转发到外网而不到达被测进程。
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
+        .no_proxy()
         .build()
         .unwrap()
 }
@@ -502,7 +525,12 @@ fn test_streaming_response() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let t0 = Instant::now();
-        let resp = reqwest::Client::new().get(&url).send().await.expect("stream req");
+        // 禁用环境代理，保证流式请求直达本机被测进程。
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("no-proxy client");
+        let resp = client.get(&url).send().await.expect("stream req");
         assert_eq!(resp.status().as_u16(), 200);
         assert_eq!(resp.headers().get("content-type").unwrap(), "text/event-stream");
         assert!(resp.headers().get("content-length").is_none());
