@@ -29,6 +29,16 @@ pub(crate) const CHECK_INTERVAL_MS: i64 = 10_000;
 /// two must change together.
 pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
 
+/// A connection that lived past this long since a successful handshake counts
+/// as "stable" for the connector's failure backoff: its end resets the backoff.
+/// A connection that dies sooner (or never handshaked) counts as a failure —
+/// covers both "server unreachable" (connect error) and "server accepts then
+/// immediately closes" (handshake ok, dies in ~1s). 10s comfortably exceeds
+/// the sub-second "accept-then-close" churn while staying well under the
+/// keepalive liveness window, so a genuinely usable tunnel is never miscounted
+/// as a failure.
+const STABLE_LIFETIME: Duration = Duration::from_secs(10);
+
 /// Status of a client connection. Mirrors Go's `CONNECTING/IDLE/RUNNING` iota,
 /// with an extra `Closed` for idempotent shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +60,11 @@ pub struct Connection {
     /// arrives within ~RTT of each ping. If nothing arrives for
     /// `liveness_timeout`, the tunnel is dead and must be re-established.
     last_activity: Mutex<Instant>,
+    /// When the tunnel became usable (handshake + greeting succeeded). `None`
+    /// until then (or if connect failed before then). Used by `shutdown()` to
+    /// tell a stable connection from one the server accepted then immediately
+    /// closed, which drives the pool connector's failure backoff.
+    connected_at: Mutex<Option<Instant>>,
     cancel: CancellationToken,
     self_weak: Weak<Connection>,
 }
@@ -61,6 +76,7 @@ impl Connection {
             pool,
             status: Mutex::new(Status::Connecting),
             last_activity: Mutex::new(Instant::now()),
+            connected_at: Mutex::new(None),
             cancel: CancellationToken::new(),
             self_weak: weak.clone(),
         })
@@ -70,6 +86,12 @@ impl Connection {
     /// task to detect half-open links).
     fn last_activity(&self) -> Instant {
         *self.last_activity.lock().unwrap()
+    }
+
+    /// When the tunnel became usable, if ever (used by `shutdown` to score the
+    /// connection's lifecycle for the connector backoff).
+    fn connected_at(&self) -> Option<Instant> {
+        *self.connected_at.lock().unwrap()
     }
 
     /// Dial the server and, on success, spawn the driver, serve and keepalive
@@ -125,6 +147,11 @@ impl Connection {
             self.shutdown();
             return Err("greeting error".to_string());
         }
+        // Handshake + greeting succeeded: mark when the tunnel became usable.
+        // `shutdown()` uses the elapsed-since to tell a stable connection from
+        // one the server accepted then immediately closed, which drives the
+        // pool connector's failure backoff.
+        *self.connected_at.lock().unwrap() = Some(Instant::now());
 
         let this = match self.self_weak.upgrade() {
             Some(a) => a,
@@ -166,6 +193,12 @@ impl Connection {
 
     /// Close the connection: cancel the driver/serve/ping and remove it from
     /// the pool. Idempotent.
+    ///
+    /// Also scores the connection's lifecycle into the pool connector's failure
+    /// backoff: a connection that never handshaked (connect error) or that
+    /// died within `STABLE_LIFETIME` of becoming usable (server accepts then
+    /// immediately closes) counts as a failure and grows the backoff; one that
+    /// lived past `STABLE_LIFETIME` counts as a success and resets it.
     pub fn shutdown(&self) {
         let already = {
             let mut s = self.status.lock().unwrap();
@@ -176,10 +209,15 @@ impl Connection {
         if already {
             return;
         }
-        self.cancel.cancel();
         if let Some(pool) = self.pool.upgrade() {
+            let stable = self
+                .connected_at()
+                .map(|t| t.elapsed() >= STABLE_LIFETIME)
+                .unwrap_or(false);
+            pool.note_outcome(stable);
             pool.remove(self);
         }
+        self.cancel.cancel();
     }
 
     pub fn status(&self) -> Status {
