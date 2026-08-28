@@ -234,7 +234,7 @@ routes :
 | `targets` | One or more `/register` URLs to dial out to. The client opens a connection pool to each. |
 | `poolidlesize` | Idle tunnels kept warm per server. Raises it for low-latency first byte. |
 | `poolmaxsize` | Hard cap on concurrent tunnels per server. Size to your peak concurrency; beyond it the server waits up to `timeout` ms then returns 526. |
-| `livenesstimeout` | ms before a tunnel that has received no frame (pong/data) is closed as half-open and reconnected. Default 90000 (90 s, < the server's 120 s, so the client self-heals before the server reaps the pool). 0 = default. |
+| `livenesstimeout` | ms before a tunnel that has received no frame (pong/data) is closed as half-open and reconnected. Default 90000 (90 s, < the server's 120 s, so the client self-heals before the server reaps the pool). Must exceed ~2× the 30 s ping interval (below 60000 ms pongs can't be observed reliably and healthy links would be false-reaped); a too-small value falls back to the default and logs a warning. 0 = default. |
 | `secretkey` | Sent as `X-SECRET-KEY` on the WebSocket handshake. Must equal the server's `secretkey` or the tunnel is rejected (→ 526). |
 | `routes` | The **arrival host → upstream base** map. The arrival host is the `Host` the caller targets on the server (`127.0.0.1:8080`, `llm.example.com`). The client appends the request path + query to the upstream base. Matching tries `host:port` first, then `host`. |
 | `id` | Optional client id; a random UUID is generated on startup if omitted. |

@@ -1,8 +1,19 @@
 //! Client configuration.
 
 use crate::common::Rule;
+use crate::log;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Minimum sane `livenesstimeout` (ms). The client judges liveness by pong
+/// arrival, and pongs only come in response to the 30s keepalive ping (the
+/// server never pongs proactively). A timeout below ~2x the ping interval
+/// cannot reliably observe two pongs, so on a healthy idle link the gap
+/// between pongs (~30s) would already exceed it and the reaper would
+/// false-reap live connections — draining and churning the whole pool.
+/// Any configured value below this floor falls back to the default (and logs
+/// a warning), so a too-small value degrades to "safe" instead of "broken".
+const MIN_LIVENESS_TIMEOUT_MS: i64 = 60_000;
 
 /// Configures a WSP client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -97,6 +108,18 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     // >= 0 > a negative threshold), silently killing the whole pool.
     if config.liveness_timeout <= 0 {
         config.liveness_timeout = default_liveness_timeout();
+    } else if config.liveness_timeout < MIN_LIVENESS_TIMEOUT_MS {
+        // The client judges liveness by pong arrival, and pongs only come in
+        // response to the 30s ping; a timeout below ~2x the ping interval
+        // cannot reliably see two pongs and would false-reap healthy links,
+        // churning the pool. Clamp to the default and warn so the operator
+        // knows their value was overridden.
+        log::log(format!(
+            "livenesstimeout {}ms is below the minimum {}ms (must exceed ~2x the 30s ping \
+             interval: pongs only arrive in response to a ping); falling back to default {}ms",
+            config.liveness_timeout, MIN_LIVENESS_TIMEOUT_MS, default_liveness_timeout()
+        ));
+        config.liveness_timeout = default_liveness_timeout();
     }
     for rule in config.whitelist.iter_mut() {
         rule.compile().map_err(|e| e.to_string())?;
@@ -105,4 +128,55 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
         rule.compile().map_err(|e| e.to_string())?;
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The client judges liveness by pong arrival, and pongs only come in
+    //! response to the 30s ping — so a `livenesstimeout` below ~2x the ping
+    //! interval would false-reap healthy links and churn the pool. These
+    //! tests pin the load-time floor: too-small / unset / negative values
+    //! all fall back to the safe default, while a sane value is preserved.
+
+    use super::*;
+
+    fn load_with(liveness: &str) -> Config {
+        let dir = format!(
+            "{}/wsp-cfg-{}",
+            std::env::temp_dir().to_string_lossy(),
+            std::process::id()
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/client-{}.cfg", uuid::Uuid::new_v4());
+        let yaml = format!(
+            "---\ntargets:\n - ws://127.0.0.1:8080/register\nsecretkey: k\n{liveness}\n"
+        );
+        std::fs::write(&path, yaml).unwrap();
+        load_configuration(&path).unwrap()
+    }
+
+    #[test]
+    fn liveness_below_minimum_falls_back_to_default() {
+        // 5s is below the 60s floor (cannot see two 30s pings) -> default.
+        let c = load_with("livenesstimeout: 5000");
+        assert_eq!(c.liveness_timeout, default_liveness_timeout());
+    }
+
+    #[test]
+    fn liveness_unset_or_non_positive_falls_back_to_default() {
+        // Explicit 0 and negative both -> default (no underflow reap).
+        let c = load_with("livenesstimeout: 0");
+        assert_eq!(c.liveness_timeout, default_liveness_timeout());
+        let c = load_with("livenesstimeout: -1");
+        assert_eq!(c.liveness_timeout, default_liveness_timeout());
+    }
+
+    #[test]
+    fn liveness_at_or_above_minimum_is_preserved() {
+        // Exactly the floor and a large value are kept as-is.
+        let c = load_with(&format!("livenesstimeout: {MIN_LIVENESS_TIMEOUT_MS}"));
+        assert_eq!(c.liveness_timeout, MIN_LIVENESS_TIMEOUT_MS);
+        let c = load_with("livenesstimeout: 120000");
+        assert_eq!(c.liveness_timeout, 120_000);
+    }
 }
