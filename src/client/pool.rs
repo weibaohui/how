@@ -110,16 +110,20 @@ impl Pool {
 
     /// Start the pool: connect once, then refresh every second.
     pub fn start(self: Arc<Self>) {
-        self.log_stats_if_changed();
+        // connector() FIRST, then the stats snapshot: the freshly created
+        // `Connecting` entries are captured by this tick's line instead of
+        // appearing only after they resolve (a sub-second connect would
+        // otherwise never show a connecting>0 state at all).
         self.connector();
+        self.log_stats_if_changed();
         let this = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = this.done.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        this.log_stats_if_changed();
                         this.connector();
+                        this.log_stats_if_changed();
                     }
                 }
             }

@@ -300,7 +300,7 @@ impl Connection {
                 if served == 1 { "" } else { "s" }
             )),
             None => log::log(format!(
-                "tunnel#{} closed (never connected — dial/handshake failed)",
+                "tunnel#{} closed (never usable — dial, handshake or greeting failed)",
                 self.id()
             )),
         }
