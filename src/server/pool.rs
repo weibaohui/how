@@ -19,6 +19,7 @@ pub struct Pool {
     idle_tx: mpsc::Sender<Arc<Connection>>,
     idle_timeout_ms: i64,
     liveness_timeout_ms: i64,
+    busy_liveness_timeout_ms: i64,
     done: Mutex<bool>,
 }
 
@@ -28,6 +29,7 @@ impl Pool {
         idle_tx: mpsc::Sender<Arc<Connection>>,
         idle_timeout_ms: i64,
         liveness_timeout_ms: i64,
+        busy_liveness_timeout_ms: i64,
     ) -> Arc<Self> {
         Arc::new(Pool {
             id,
@@ -36,6 +38,7 @@ impl Pool {
             idle_tx,
             idle_timeout_ms,
             liveness_timeout_ms,
+            busy_liveness_timeout_ms,
             done: Mutex::new(false),
         })
     }
@@ -73,6 +76,25 @@ impl Pool {
             .drain(..)
             .filter_map(|connection| {
                 let st = connection.status();
+                if st == Status::Busy {
+                    // Busy fuse: a busy connection serving traffic constantly
+                    // RECEIVES frames (a streamed response keeps the
+                    // watermark fresh). One that has received nothing for
+                    // longer than the busy liveness timeout is stuck in a
+                    // silent phase — legitimately (slow upload, hung
+                    // upstream, SSE gaps) or not (bidirectional partition,
+                    // where the client's close can never arrive). Past the
+                    // operator-chosen budget, close it: the hanging request
+                    // fails fast instead of forever, and the slot frees up.
+                    let silent_ms = connection.last_activity().elapsed().as_millis() as i64;
+                    if silent_ms > self.busy_liveness_timeout_ms {
+                        log::log(format!(
+                            "Reaping stuck busy tunnel#{} from {} (no frame for {}ms)",
+                            connection.id, connection.pool_id, silent_ms
+                        ));
+                        connection.close();
+                    }
+                }
                 if st == Status::Idle {
                     // Liveness: a connection that has received no frame at all
                     // for longer than the liveness timeout is half-open (the
@@ -154,5 +176,122 @@ impl Pool {
             }
         }
         (idle, busy, closed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The cleaner's Busy-connection fuse: a busy connection actively
+    //! serving traffic constantly receives frames, so one that has received
+    //! NOTHING for longer than `busylivenesstimeout` is stuck (at best a
+    //! hung upstream, at worst a bidirectional partition where the client's
+    //! close can never arrive) and must be closed — otherwise a proxied
+    //! request with no `upstreamtimeout` hangs forever. Idle-connection
+    //! behavior must stay untouched by the fuse.
+
+    use super::*;
+    use crate::server::connection::dummy_connection;
+    use std::time::{Duration, Instant};
+
+    const IDLE_TIMEOUT_MS: i64 = 60_000;
+    const LIVENESS_TIMEOUT_MS: i64 = 120_000;
+    const BUSY_LIVENESS_TIMEOUT_MS: i64 = 600_000;
+
+    fn test_pool(idle_tx: mpsc::Sender<Arc<Connection>>) -> Arc<Pool> {
+        Pool::new(
+            "test-pool".to_string(),
+            idle_tx,
+            IDLE_TIMEOUT_MS,
+            LIVENESS_TIMEOUT_MS,
+            BUSY_LIVENESS_TIMEOUT_MS,
+        )
+    }
+
+    /// A BUSY connection silent past the busy fuse is closed and dropped
+    /// from the pool (the request hanging on it fails instead of hanging
+    /// forever).
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleaner_reaps_stuck_busy_connection() {
+        let (idle_tx, _idle_rx) = mpsc::channel(8);
+        let pool = test_pool(idle_tx.clone());
+        let (conn, _peer) = dummy_connection(1, idle_tx).await;
+        pool.connections.lock().unwrap().push(conn.clone());
+        assert!(conn.take(), "fresh connection starts Idle and takes");
+        assert_eq!(conn.status(), Status::Busy);
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_millis(
+                BUSY_LIVENESS_TIMEOUT_MS as u64 + 60_000,
+            ))
+            .unwrap_or_else(Instant::now);
+        conn.set_last_activity(long_ago);
+
+        assert!(
+            pool.is_empty(),
+            "a busy connection silent past the fuse must be reaped"
+        );
+        assert!(conn.is_closed());
+    }
+
+    /// A BUSY connection with fresh activity (traffic is flowing) must NOT
+    /// be touched by the fuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleaner_keeps_busy_connection_with_fresh_activity() {
+        let (idle_tx, _idle_rx) = mpsc::channel(8);
+        let pool = test_pool(idle_tx.clone());
+        let (conn, _peer) = dummy_connection(1, idle_tx).await;
+        pool.connections.lock().unwrap().push(conn.clone());
+        assert!(conn.take());
+        // last_activity stays "now" — frames are arriving.
+
+        assert!(
+            !pool.is_empty(),
+            "an active busy connection must survive the cleaner"
+        );
+        assert_eq!(conn.status(), Status::Busy);
+    }
+
+    /// A busy connection silent BELOW the fuse (a legitimate silent phase —
+    /// waiting on upstream headers) must survive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleaner_keeps_busy_connection_below_the_fuse() {
+        let (idle_tx, _idle_rx) = mpsc::channel(8);
+        let pool = test_pool(idle_tx.clone());
+        let (conn, _peer) = dummy_connection(1, idle_tx).await;
+        pool.connections.lock().unwrap().push(conn.clone());
+        assert!(conn.take());
+        let recent = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .unwrap_or_else(Instant::now);
+        conn.set_last_activity(recent); // 30s < 600s fuse
+
+        assert!(
+            !pool.is_empty(),
+            "a busy connection in a legitimate silent phase must survive"
+        );
+        assert_eq!(conn.status(), Status::Busy);
+    }
+
+    /// The fuse must not change IDLE handling: a healthy idle connection
+    /// (fresh watermark) stays, and one idle past the idle liveness timeout
+    /// is still reaped exactly as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleaner_idle_handling_unchanged_by_the_fuse() {
+        let (idle_tx, _idle_rx) = mpsc::channel(8);
+        let pool = test_pool(idle_tx.clone());
+        pool.set_size(10);
+        let (healthy, _p1) = dummy_connection(1, idle_tx.clone()).await;
+        let (half_open, _p2) = dummy_connection(2, idle_tx).await;
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_millis(LIVENESS_TIMEOUT_MS as u64 + 60_000))
+            .unwrap_or_else(Instant::now);
+        half_open.set_last_activity(long_ago);
+        pool.connections
+            .lock()
+            .unwrap()
+            .extend([healthy.clone(), half_open.clone()]);
+
+        assert!(!pool.is_empty(), "the healthy idle connection must stay");
+        assert!(half_open.is_closed(), "the half-open idle one is reaped");
+        assert_eq!(healthy.status(), Status::Idle);
     }
 }

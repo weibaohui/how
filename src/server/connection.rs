@@ -153,6 +153,13 @@ impl Connection {
         *self.last_activity.lock().unwrap()
     }
 
+    /// Test support: backdate the last-frame timestamp (the driver refreshes
+    /// it in production; tests simulate a silent / half-open link).
+    #[cfg(test)]
+    pub(crate) fn set_last_activity(&self, t: Instant) {
+        *self.last_activity.lock().unwrap() = t;
+    }
+
     /// Notify that this connection is going to be used. Returns false if the
     /// connection is closed or already busy.
     pub fn take(&self) -> bool {
@@ -372,4 +379,23 @@ async fn driver<S>(
     }
     drop(read_tx);
     drop(write_rx);
+}
+
+/// Test support: build a server-side Connection over an in-memory duplex
+/// socket. The returned peer end must be HELD by the test (dropping it is
+/// an EOF that ends the driver); write nothing to it to simulate a silent
+/// (half-open) peer.
+#[cfg(test)]
+pub(crate) async fn dummy_connection(
+    id: u64,
+    idle_tx: mpsc::Sender<Arc<Connection>>,
+) -> (Arc<Connection>, tokio::io::DuplexStream) {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let (io, peer) = tokio::io::duplex(64);
+    let ws = WebSocketStream::from_raw_socket(io, Role::Server, None).await;
+    (
+        Connection::new("test-pool".to_string(), id, ws, idle_tx),
+        peer,
+    )
 }
