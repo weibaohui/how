@@ -32,6 +32,16 @@ pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
 /// run faster than its own probe).
 pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Floor for the Running-tunnel staleness threshold (both watermarks must
+/// exceed it before the health round reaps a Running tunnel). A healthy
+/// Running tunnel that is silently waiting for upstream first bytes only
+/// SENDS at the keepalive ping cadence (30s), so its `last_write` watermark
+/// legitimately ages up to one ping interval; a threshold below ~2x that
+/// cadence would false-reap healthy waiting tunnels. `livenesstimeout`
+/// configures the threshold but is clamped up to this floor for Running
+/// tunnels (the floor protects the ping cadence, not the operator's value).
+pub(crate) const RUNNING_STALE_FLOOR: Duration = Duration::from_millis(2 * PING_INTERVAL_MS as u64);
+
 /// A connection that lived past this long since a successful handshake counts
 /// as "stable" for the connector's failure backoff: its end resets the backoff.
 /// A connection that dies sooner (or never handshaked) counts as a failure —
@@ -80,10 +90,11 @@ pub enum ProbeOutcome {
     /// that cannot even send a ping) — dead or unanswerable, close it so the
     /// connector dials a replacement.
     Dead,
-    /// Cannot conclude — no action, and the passive keepalive reaper still
-    /// covers the tunnel: not Idle (Running is demonstrably exchanging data,
-    /// Connecting is not up yet, Closed is already gone) or the write queue
-    /// is momentarily full (mid-stream backpressure).
+    /// Cannot conclude — no action: not Idle (a Running tunnel is covered by
+    /// the health round's dual-watermark check, a Connecting one by its age
+    /// reap, a Closed one is already gone) or the write queue is momentarily
+    /// full (mid-stream backpressure; the `stale_after` wedge backstop
+    /// covers a permanently full queue).
     Skipped,
 }
 
@@ -107,12 +118,26 @@ pub struct Connection {
     /// Requests served over this tunnel (logged on close).
     served: std::sync::atomic::AtomicU64,
     /// Last time any frame was received from the server (pong/data/ping).
-    /// Refreshed by the driver on every read; checked by the keepalive task
-    /// to detect half-open links (no traffic => the peer or the path is
-    /// gone). The client sends a ping every 30s, so on a live link a pong
-    /// arrives within ~RTT of each ping. If nothing arrives for
-    /// `liveness_timeout`, the tunnel is dead and must be re-established.
+    /// Refreshed by the driver on every read; used as the read-side
+    /// watermark by the probe's wedge backstop (`stale_after`) and, paired
+    /// with `last_write`, by the health round's Running-tunnel reap.
     last_activity: Mutex<Instant>,
+    /// Last time a frame was successfully handed to the socket (any
+    /// `stream.send()` that completed — data, pong, ping). The WRITE-side
+    /// counterpart of `last_activity`: a Running tunnel that is streaming a
+    /// response receives nothing for minutes (legitimately), so silence
+    /// alone cannot judge it — but a live tunnel is always making progress
+    /// in at least one direction. The health round reaps a Running tunnel
+    /// only when BOTH watermarks are stale: nothing received AND nothing
+    /// successfully sent (the driver is wedged in a send on a half-open
+    /// link, or the keepalive ping can no longer get out).
+    last_write: Mutex<Instant>,
+    /// When this connection object was created (start of the Connecting
+    /// phase). Read by the health round's Connecting-age reap: with
+    /// `tunneltimeout` unset a peer that accepts TCP but never completes the
+    /// handshake would otherwise hold pool capacity forever. (Mutex for
+    /// consistency with the other timestamps; written only in tests.)
+    created_at: Mutex<Instant>,
     /// Last time a PONG was received from the server (`None` until the first
     /// one). Refreshed by the driver on every `Message::Pong`; read by the
     /// active liveness probe, which must see a pong arrive AFTER its own
@@ -141,6 +166,8 @@ impl Connection {
             served: std::sync::atomic::AtomicU64::new(0),
             status: Mutex::new(Status::Connecting),
             last_activity: Mutex::new(Instant::now()),
+            last_write: Mutex::new(Instant::now()),
+            created_at: Mutex::new(Instant::now()),
             last_pong: Mutex::new(None),
             probe_tx: Mutex::new(None),
             connected_at: Mutex::new(None),
@@ -155,9 +182,10 @@ impl Connection {
         *self.id.lock().unwrap()
     }
 
-    /// Last time any frame was received from the peer (used by the keepalive
-    /// task to detect half-open links).
-    fn last_activity(&self) -> Instant {
+    /// Last time any frame was received from the peer (read-side watermark:
+    /// used by the probe's wedge backstop and, paired with `last_write`, by
+    /// the health round's Running-tunnel reap).
+    pub(crate) fn last_activity(&self) -> Instant {
         *self.last_activity.lock().unwrap()
     }
 
@@ -167,6 +195,39 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn set_last_activity(&self, t: Instant) {
         *self.last_activity.lock().unwrap() = t;
+    }
+
+    /// Last time a frame was successfully handed to the socket (write-side
+    /// watermark; see the field docs). Used together with `last_activity` by
+    /// the health round's Running-tunnel reap.
+    pub(crate) fn last_write(&self) -> Instant {
+        *self.last_write.lock().unwrap()
+    }
+
+    /// Record a successful socket write (called by the driver after every
+    /// completed `stream.send()` — data frame, pong, ping).
+    fn note_write(&self) {
+        *self.last_write.lock().unwrap() = Instant::now();
+    }
+
+    /// Test support: overwrite the write watermark (the driver refreshes it
+    /// in production; tests backdate it to simulate a wedged sender).
+    #[cfg(test)]
+    pub(crate) fn set_last_write(&self, t: Instant) {
+        *self.last_write.lock().unwrap() = t;
+    }
+
+    /// When this connection object was created (used by the health round's
+    /// Connecting-age reap).
+    pub(crate) fn created_at(&self) -> Instant {
+        *self.created_at.lock().unwrap()
+    }
+
+    /// Test support: backdate the creation time (tests simulate a tunnel
+    /// stuck in the Connecting phase).
+    #[cfg(test)]
+    pub(crate) fn set_created_at(&self, t: Instant) {
+        *self.created_at.lock().unwrap() = t;
     }
 
     /// When the tunnel became usable, if ever (used by `shutdown` to score the
@@ -235,19 +296,31 @@ impl Connection {
         // `Connecting` 状态的连接不会永久占用池容量。
         let tunnel_deadline = (config.tunnel_timeout > 0)
             .then(|| Duration::from_millis(config.tunnel_timeout as u64));
-        let stream = with_deadline(
-            tunnel_deadline,
-            "dial",
-            tokio::net::TcpStream::connect((host.as_str(), port)),
-        )
-        .await?;
+        // Every phase also races the cancel token: the health round reaps
+        // stale Connecting tunnels via `shutdown()` — a dial wedged in the
+        // kernel, or a peer that accepts TCP but never answers the handshake,
+        // must not leak this task after the pool entry has been removed.
+        let stream = tokio::select! {
+            _ = self.cancel.cancelled() => {
+                return Err("connection closed while dialing".to_string())
+            }
+            r = with_deadline(
+                tunnel_deadline,
+                "dial",
+                tokio::net::TcpStream::connect((host.as_str(), port)),
+            ) => r?,
+        };
         let _ = stream.set_nodelay(true);
-        let (ws, resp) = with_deadline(
-            tunnel_deadline,
-            "websocket handshake",
-            tokio_tungstenite::client_async(req, stream),
-        )
-        .await?;
+        let (ws, resp) = tokio::select! {
+            _ = self.cancel.cancelled() => {
+                return Err("connection closed during the websocket handshake".to_string())
+            }
+            r = with_deadline(
+                tunnel_deadline,
+                "websocket handshake",
+                tokio_tungstenite::client_async(req, stream),
+            ) => r?,
+        };
 
         // Adopt the SERVER-assigned tunnel number from the handshake
         // response — the server is the single numbering authority, so from
@@ -274,12 +347,13 @@ impl Connection {
 
         let mut ws = ws;
         // greeting 发送也限时：握手后对端不消费数据时同样不能永久挂起。
-        let greeted = with_deadline(
-            tunnel_deadline,
-            "greeting",
-            ws.send(Message::text(greeting)),
-        )
-        .await;
+        // 同样竞速 cancel：被健康轮收割的连接不能卡在发送问候上。
+        let greeted = tokio::select! {
+            _ = self.cancel.cancelled() => {
+                return Err("connection closed while sending the greeting".to_string())
+            }
+            r = with_deadline(tunnel_deadline, "greeting", ws.send(Message::text(greeting))) => r,
+        };
         if let Err(e) = greeted {
             self.shutdown();
             return Err(e);
@@ -385,8 +459,9 @@ impl Connection {
     /// by status" into "verified available" — the basis of the pool's
     /// periodic health round, which guarantees the server always has usable
     /// tunnels instead of a pool of half-open ones the client still believes
-    /// in. (This is the ONLY dead-link detector: the per-connection passive
-    /// reaper was removed once probes landed.)
+    /// in. (Idle-tunnel dead-link detection lives HERE; the same health
+    /// round reaps wedged Running tunnels via the dual `last_activity` /
+    /// `last_write` watermark check and stale Connecting tunnels by age.)
     ///
     /// `stale_after` is the wedge backstop, inherited from the removed
     /// passive reaper: a tunnel whose write queue is too full to even send
@@ -433,7 +508,12 @@ impl Connection {
                     ProbeOutcome::Skipped
                 };
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => return ProbeOutcome::Skipped,
+            // Write channel CLOSED: the driver task (the tunnel's only
+            // reader/writer) is gone, so this tunnel can never serve a
+            // request again — conclude Dead, don't wait for the serve loop
+            // to wind down. The tunnel was Idle at entry, so no in-flight
+            // request depends on it.
+            Err(mpsc::error::TrySendError::Closed(_)) => return ProbeOutcome::Dead,
         }
         // Poll for the pong: a healthy link answers in ~RTT, so poll finely
         // (but never coarser than a quarter of the deadline).
@@ -488,6 +568,10 @@ async fn driver<S>(
             if stream.send(Message::Pong(p)).await.is_err() {
                 break;
             }
+            // A completed send is progress on the write side — the health
+            // round's Running-tunnel reap keys on BOTH watermarks going
+            // stale, so every successful send must refresh this one.
+            conn.note_write();
         }
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -522,6 +606,10 @@ async fn driver<S>(
                         if stream.send(m).await.is_err() {
                             break;
                         }
+                        // Successful socket write: refresh the write-side
+                        // watermark (keeps a healthily streaming Running
+                        // tunnel from ever looking wedged).
+                        conn.note_write();
                     }
                     None => break,
                 }
@@ -991,11 +1079,7 @@ mod tests {
     async fn keepalive_stops_when_channel_closes() {
         let cancel = CancellationToken::new();
         let (write_tx, mut rx) = mpsc::channel::<Message>(8);
-        let handle = tokio::spawn(keepalive_loop(
-            write_tx,
-            cancel,
-            Duration::from_millis(15),
-        ));
+        let handle = tokio::spawn(keepalive_loop(write_tx, cancel, Duration::from_millis(15)));
         rx.recv().await.expect("first ping");
         drop(rx); // driver side gone -> sender errors -> loop must finish
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1091,7 +1175,9 @@ mod tests {
             // task runs at the first await); the margin only absorbs a
             // heavily loaded test runner so the case never flakes.
             let probe =
-                tokio::spawn(async move { probing.probe(Duration::from_secs(5), FAR_FUTURE).await });
+                tokio::spawn(
+                    async move { probing.probe(Duration::from_secs(5), FAR_FUTURE).await },
+                );
             // Fake server: the probe's ping arrives, then the pong comes back
             // (the driver records it via record_pong).
             let ping = rx.recv().await.expect("probe must send a ping");
@@ -1158,7 +1244,8 @@ mod tests {
             tx.try_send(Message::text("fill")).unwrap();
             *conn.last_activity.lock().unwrap() = Instant::now(); // fresh
             assert_eq!(
-                conn.probe(Duration::from_millis(20), Duration::from_secs(90)).await,
+                conn.probe(Duration::from_millis(20), Duration::from_secs(90))
+                    .await,
                 ProbeOutcome::Skipped
             );
         }
@@ -1177,13 +1264,14 @@ mod tests {
             let (tx, _rx) = mpsc::channel::<Message>(1); // never drained
             *conn.probe_tx.lock().unwrap() = Some(tx.clone());
             tx.try_send(Message::text("fill")).unwrap(); // queue full
-            // checked_sub: never construct a pre-epoch Instant (would panic).
+                                                         // checked_sub: never construct a pre-epoch Instant (would panic).
             let stale = Instant::now()
                 .checked_sub(Duration::from_secs(300))
                 .unwrap_or_else(Instant::now);
             *conn.last_activity.lock().unwrap() = stale;
             assert_eq!(
-                conn.probe(Duration::from_millis(20), Duration::from_secs(90)).await,
+                conn.probe(Duration::from_millis(20), Duration::from_secs(90))
+                    .await,
                 ProbeOutcome::Dead
             );
         }
@@ -1204,8 +1292,26 @@ mod tests {
             *conn.last_activity.lock().unwrap() = stale;
             conn.set_status(Status::Running);
             assert_eq!(
-                conn.probe(Duration::from_millis(20), Duration::from_secs(90)).await,
+                conn.probe(Duration::from_millis(20), Duration::from_secs(90))
+                    .await,
                 ProbeOutcome::Skipped
+            );
+        }
+
+        /// Write channel CLOSED (the receiver — the driver task — is gone):
+        /// the tunnel's only reader/writer is dead, so it can never serve a
+        /// request again. Conclude Dead immediately rather than Skipped
+        /// waiting for the serve loop to wind down.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_reports_dead_when_writer_closed() {
+            let pool = dummy_pool();
+            let conn = Connection::new(Arc::downgrade(&pool));
+            conn.set_status(Status::Idle);
+            let rx = wire_probe_tx(&conn);
+            drop(rx); // simulate the driver task exiting
+            assert_eq!(
+                conn.probe(Duration::from_millis(20), FAR_FUTURE).await,
+                ProbeOutcome::Dead
             );
         }
     }

@@ -50,7 +50,10 @@ pub struct Config {
     /// until the client is restarted. Must exceed the 10s probe deadline;
     /// below the floor it falls back to the default and logs a warning.
     /// `0` falls back to the default.
-    #[serde(rename = "healthcheckinterval", default = "default_health_check_interval")]
+    #[serde(
+        rename = "healthcheckinterval",
+        default = "default_health_check_interval"
+    )]
     pub health_check_interval: i64,
     /// Upstream connect timeout (ms): bounds DNS + TCP + TLS for dialing a
     /// route's upstream. Caps the damage of a blackholed address (dropped
