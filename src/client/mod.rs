@@ -31,21 +31,19 @@ pub struct Client {
 impl Client {
     /// 创建一个新的 how-client。
     /// 关键说明：
-    /// - `connect_timeout(5s)`：DNS+TCP 握手限时 5 秒。
-    ///   常见的"十几秒到几十秒延迟"根因就是：DNS 返回了 IPv6 AAAA 记录，
-    ///   但实际网络 IPv6 不通，操作系统要等 20~30 秒 TCP SYN 超时才会回退
-    ///   到 IPv4。5 秒的 connect_timeout 会提前打断并让上层（通常是 hyper）
-    ///   立即尝试下一个地址族 / 下一个 IP。
+    /// - 超时全部**显式配置才生效**（`connecttimeout` / `streamidletimeout` /
+    ///   `upstreamidletimeout` 等，0/未配置 = 不限时），没有任何隐藏默认值。
+    /// - `connecttimeout`：DNS+TCP 握手限时。常见的"十几秒到几十秒延迟"
+    ///   根因之一是：DNS 返回了 IPv6 AAAA 记录，但实际网络 IPv6 不通，
+    ///   操作系统要等 20~30 秒 TCP SYN 超时才会回退到 IPv4。
     /// - `local_address(0.0.0.0)`：绑定 IPv4 源地址，底层仅解析并尝试 IPv4，
     ///   彻底跳过 IPv6 回退等待。若后续环境确实需要 IPv6，可去掉这一行并
     ///   改依赖 `trust-dns` 实现 Happy Eyeballs。
-    /// - `timeout(60s)`：已改为 `read_timeout(60s)`（按"每次读取"计的停滞
-    ///   检测，不是总期限）：流式响应只要还在持续出数据就永不截断，而彻底
-    ///   停止发送的连接在 60s 内死亡，不会挂死 Running 隧道。总期限会截断
-    ///   超过它的 SSE 长流（reqwest 语义是"直到 body 结束"），对 LLM 代理
-    ///   是错误的取舍。上游调用的"到响应头为止"期限由 `upstreamtimeout`
-    ///   配置（默认 30s），在 serve 循环里单独包裹。
-    /// - `pool_idle_timeout(90s)`：空闲连接超过 90 秒即丢弃，避免连接被
+    /// - `streamidletimeout`（按"每次读取"计的停滞检测，不是总期限）：
+    ///   流式响应只要还在持续出数据就永不截断，而彻底停止发送的连接在
+    ///   期限内死亡，不会挂死 Running 隧道。总期限会截断超过它的 SSE 长流
+    ///   （reqwest 语义是"直到 body 结束"），对 LLM 代理是错误的取舍。
+    /// - `upstreamidletimeout`：上游空闲连接超过该时长即丢弃，避免连接被
     ///   中间设备静默断开后，复用一条已经半开的连接导致再等一个超时。
     pub fn new(config: ClientConfig) -> Self {
         // Outbound proxy: decide once, use everywhere. The same pure
@@ -78,27 +76,37 @@ impl Client {
         let matcher_mode = proxy_mode.clone();
         let matcher_noproxy = noproxy_cfg.clone();
         let matcher_env = proxy_env.clone();
-        let http_client = match reqwest::Client::builder()
+        // Timeouts are explicit-only: an option is applied iff it was
+        // configured (> 0). Unset means exactly "no limit" — nothing the
+        // operator did not ask for is imposed on the traffic.
+        let ms = |v: i64| Duration::from_millis(v as u64);
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
-            .connect_timeout(Duration::from_millis(config.connect_timeout as u64))
-            // Per-read stall detection, NOT a total deadline: a slow but
-            // flowing SSE stream runs as long as it keeps flowing, while a
-            // connection that stops sending dies here instead of hanging a
-            // Running tunnel forever. (A client-level `timeout()` would cap
-            // the WHOLE response — reqwest: "until the response body has
-            // finished" — and truncate every stream longer than it, which
-            // is exactly the wrong trade for an LLM proxy.)
-            .read_timeout(Duration::from_secs(60))
-            .pool_idle_timeout(Duration::from_secs(90))
             .local_address(Some(Ipv4Addr::UNSPECIFIED.into()))
             .proxy(reqwest::Proxy::custom(move |url| {
                 match proxy::decide(url.as_str(), &matcher_mode, &matcher_noproxy, &matcher_env) {
                     proxy::Decision::Via(p) => Some(p),
                     proxy::Decision::Direct(_) => None,
                 }
-            }))
-            .build()
-        {
+            }));
+        if config.connect_timeout > 0 {
+            builder = builder.connect_timeout(ms(config.connect_timeout));
+        }
+        if config.stream_idle_timeout > 0 {
+            // Per-read stall detection, NOT a total deadline: a slow but
+            // flowing SSE stream runs as long as it keeps flowing, while a
+            // connection that stops sending dies here instead of hanging a
+            // Running tunnel forever. (A client-level `timeout()` would cap
+            // the WHOLE response — reqwest: "until the response body has
+            // finished" — and truncate every stream longer than it.)
+            builder = builder.read_timeout(ms(config.stream_idle_timeout));
+        }
+        // Explicitly None when unconfigured: reqwest's own default is a
+        // 90s idle reap, which would violate "unset = no limit".
+        builder = builder.pool_idle_timeout(
+            (config.upstream_idle_timeout > 0).then(|| ms(config.upstream_idle_timeout)),
+        );
+        let http_client = match builder.build() {
             Ok(c) => c,
             Err(e) => {
                 log::log(format!(

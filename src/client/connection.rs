@@ -39,10 +39,23 @@ pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
 /// as a failure.
 const STABLE_LIFETIME: Duration = Duration::from_secs(10);
 
-/// 建立连接各阶段（TCP 拨号 / WebSocket 握手 / greeting 发送）的超时上限。
-/// 任一阶段超过该时间即判定失败：否则对端无响应时 `connect()` 会永久挂起，
-/// `Connecting` 状态的连接将一直占用池容量，池子再也无法补充新连接。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Run `f` under `deadline` — `None` means "no limit" (the timeout keys are
+/// explicit-only: unconfigured applies nothing). On elapse the error names
+/// the phase (`what`) and the configured budget; the inner error's `Display`
+/// passes through unchanged.
+async fn with_deadline<F, T, E>(deadline: Option<Duration>, what: &str, f: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match deadline {
+        Some(d) => match tokio::time::timeout(d, f).await {
+            Ok(r) => r.map_err(|e| format!("{e}")),
+            Err(_) => Err(format!("{what} timeout after {}ms", d.as_millis())),
+        },
+        None => f.await.map_err(|e| format!("{e}")),
+    }
+}
 
 /// Status of a client connection. Mirrors Go's `CONNECTING/IDLE/RUNNING` iota,
 /// with an extra `Closed` for idempotent shutdown.
@@ -131,28 +144,24 @@ impl Connection {
         }
         let host = req.uri().host().unwrap_or("127.0.0.1").to_string();
         let port = req.uri().port_u16().unwrap_or(80);
-        // TCP 拨号套上超时：SYN 被丢弃（如防火墙静默丢包）时不会永久挂起。
-        let stream = tokio::time::timeout(
-            CONNECT_TIMEOUT,
+        // 隧道建立各阶段限时（`tunneltimeout` 配置；0/未配置 = 不限时）：
+        // SYN 被丢弃（防火墙静默丢包）或对端接受 TCP 却不回 101 时，
+        // `Connecting` 状态的连接不会永久占用池容量。
+        let tunnel_deadline = (config.tunnel_timeout > 0)
+            .then(|| Duration::from_millis(config.tunnel_timeout as u64));
+        let stream = with_deadline(
+            tunnel_deadline,
+            "dial",
             tokio::net::TcpStream::connect((host.as_str(), port)),
         )
-        .await
-        .map_err(|_| format!("dial timeout after {}s", CONNECT_TIMEOUT.as_secs()))?
-        .map_err(|e| format!("{}", e))?;
+        .await?;
         let _ = stream.set_nodelay(true);
-        // WebSocket 握手同样限时：对端接受 TCP 却不回 101 时不能无限等待。
-        let (ws, _resp) = tokio::time::timeout(
-            CONNECT_TIMEOUT,
+        let (ws, _resp) = with_deadline(
+            tunnel_deadline,
+            "websocket handshake",
             tokio_tungstenite::client_async(req, stream),
         )
-        .await
-        .map_err(|_| {
-            format!(
-                "websocket handshake timeout after {}s",
-                CONNECT_TIMEOUT.as_secs()
-            )
-        })?
-        .map_err(|e| format!("{}", e))?;
+        .await?;
 
         log::log(format!("Connected to {}", target));
 
@@ -164,10 +173,12 @@ impl Connection {
 
         let mut ws = ws;
         // greeting 发送也限时：握手后对端不消费数据时同样不能永久挂起。
-        let greeted = tokio::time::timeout(CONNECT_TIMEOUT, ws.send(Message::text(greeting)))
-            .await
-            .map_err(|_| format!("greeting timeout after {}s", CONNECT_TIMEOUT.as_secs()))
-            .and_then(|r| r.map_err(|_| "greeting error".to_string()));
+        let greeted = with_deadline(
+            tunnel_deadline,
+            "greeting",
+            ws.send(Message::text(greeting)),
+        )
+        .await;
         if let Err(e) = greeted {
             self.shutdown();
             return Err(e);
@@ -550,16 +561,16 @@ async fn serve(
         // producer 结束（读到空 end-marker）时 body_tx 被 drop，reqwest 就知
         // 道请求体结束了；read_rx 是借用所以 serve 循环继续持有它。
         //
-        // 额外加一层上游调用超时（`upstreamtimeout` 配置，默认 30s）：
+        // 额外加一层上游调用超时（`upstreamtimeout` 配置；0/未配置 = 不限时）：
         // 只覆盖"发出请求 → 收到响应头"这一段，响应 body 在其之后流式回传、
-        // 不受它限制（流式响应由 reqwest 的 read_timeout 做停滞检测，只要
-        // 还在出数据就永不截断）。包这一层并打印耗时日志的目的是：
+        // 不受它限制。包这一层并打印耗时日志的目的是：
         //   1) 下次再遇到慢请求时，日志里能立刻看到是"上游建立连接慢"
         //      还是"上游返回数据慢"；
         //   2) 遇到配置错误等特殊情况导致 reqwest 内部 timeout 失效时，
         //      仍能保证不会无限挂住一条 Running 连接（Running 连接会阻止
         //      keepalive 的半开回收逻辑，长时间挂死会把池子拖没）。
-        let upstream_call_deadline = Duration::from_millis(config.upstream_timeout as u64);
+        let upstream_call_deadline = (config.upstream_timeout > 0)
+            .then(|| Duration::from_millis(config.upstream_timeout as u64));
         let (body_tx, body_rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
         let req_body =
             reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx));
@@ -584,8 +595,23 @@ async fn serve(
         };
         let call_start = Instant::now();
         let send_future = async { tokio::join!(producer, reqwest_req.send()).1 };
-        let resp = match tokio::time::timeout(upstream_call_deadline, send_future).await {
-            Ok(Ok(r)) => {
+        // (message, is_timeout)：未配置 upstreamtimeout 时没有超时分支。
+        let outcome = match upstream_call_deadline {
+            Some(d) => match tokio::time::timeout(d, send_future).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err((e.to_string(), false)),
+                Err(_) => Err((
+                    format!("upstream timeout after {}ms", config.upstream_timeout),
+                    true,
+                )),
+            },
+            None => match send_future.await {
+                Ok(r) => Ok(r),
+                Err(e) => Err((e.to_string(), false)),
+            },
+        };
+        let resp = match outcome {
+            Ok(r) => {
                 // 上游响应头已收到，这里只记录"到拿到响应头"的耗时；
                 // body 是流式的，后续再慢慢写回，不计入这段日志。
                 log::log(format!(
@@ -596,28 +622,24 @@ async fn serve(
                 ));
                 r
             }
-            Ok(Err(e)) => {
-                log::log(format!(
-                    "上游调用失败：{} 错误={} 已耗时={}ms",
-                    url,
-                    e,
-                    call_start.elapsed().as_millis()
-                ));
+            Err((msg, is_timeout)) => {
+                if is_timeout {
+                    log::log(format!(
+                        "上游调用超时（upstreamtimeout={}ms）：{} 已等待={}ms",
+                        config.upstream_timeout,
+                        url,
+                        call_start.elapsed().as_millis()
+                    ));
+                } else {
+                    log::log(format!(
+                        "上游调用失败：{} 错误={} 已耗时={}ms",
+                        url,
+                        msg,
+                        call_start.elapsed().as_millis()
+                    ));
+                }
                 let _ =
-                    send_error(&write_tx, &format!("Unable to execute request : {}\n", e)).await;
-                continue;
-            }
-            Err(_elapsed) => {
-                log::log(format!(
-                    "上游调用超时（30s）：{} 已等待={}ms",
-                    url,
-                    call_start.elapsed().as_millis()
-                ));
-                let _ = send_error(
-                    &write_tx,
-                    "Unable to execute request : upstream timeout after 30s\n",
-                )
-                .await;
+                    send_error(&write_tx, &format!("Unable to execute request : {msg}\n")).await;
                 continue;
             }
         };
