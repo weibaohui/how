@@ -182,6 +182,19 @@ rely on detecting it:
   server would report "no proxy available" the next morning** — exactly the
   "works all day, dead overnight" symptom.
 
+**Periodic pool health round** (`healthcheckinterval`, client only, default
+30 s). The passive check above needs up to 90 s to *notice* a dead link, and
+while a half-open tunnel still looks idle the demand-driven connector dials
+nothing — during that window the server may have no usable tunnel at all and
+requests fail until the client is restarted. The health round closes that
+gap: every interval it actively probes each idle tunnel (ping → pong, 10 s
+deadline), logs every tunnel's status (`pool health: idle=3 ok=3 ...
+|tunnel#1:ok(0s) ...`), closes the tunnels that do not answer, and dials
+replacements so the pool is topped back up to `poolidlesize` *verified*
+tunnels. If the pool is completely empty while the connector is backing off
+(the server was down and came back), each round still dials one rescue
+tunnel at the health cadence, so recovery no longer waits out the backoff.
+
 ### Optional security gatekeepers
 
 Leave empty / commented to disable. All three run **before** the proxy pool
@@ -220,6 +233,7 @@ targets :                            # HOW servers to dial out to
 poolidlesize : 10                    # tunnel target per server (idle+busy count); demand-driven
 poolmaxsize : 100                    # max concurrent WS tunnels per server
 livenesstimeout : 90000              # ms before a silent tunnel is reaped & reconnected
+healthcheckinterval : 30000          # ms between pool health rounds (probe + status log + refill)
 secretkey : ThisIsASecret            # must match the server's secretkey
 
 # Route map: arrival host (the Host the caller targets on the server)
@@ -238,6 +252,7 @@ routes :
 | `poolidlesize` | Idle tunnels kept warm per server. Raises it for low-latency first byte. |
 | `poolmaxsize` | Hard cap on concurrent tunnels per server. Size to your peak concurrency; beyond it the server waits up to `timeout` ms then returns 526. |
 | `livenesstimeout` | ms before a tunnel that has received no frame (pong/data) is closed as half-open and reconnected. Default 90000 (90 s, < the server's 120 s, so the client self-heals before the server reaps the pool). Must exceed ~2× the 30 s ping interval (below 60000 ms pongs can't be observed reliably and healthy links would be false-reaped); a too-small value falls back to the default and logs a warning. 0 = default. |
+| `healthcheckinterval` | Cadence (ms) of the periodic pool health round: actively probe every idle tunnel (ping → wait for the pong, 10 s deadline), log each tunnel's status, close the unresponsive ones, and dial replacements so the pool always holds `poolidlesize` *verified-available* tunnels. When the pool is completely empty and the connector is in dial backoff (up to 60 s after consecutive failures), each round still dials one rescue tunnel — the health cadence itself bounds the retry rate — so the server regains a tunnel within ~one interval after it comes back, without restarting the client. Default 30000; must exceed the 10 s probe deadline (below it falls back to the default and logs a warning). 0 = default. |
 | `secretkey` | Sent as `X-SECRET-KEY` on the WebSocket handshake. Must equal the server's `secretkey` or the tunnel is rejected (→ 526). |
 | `routes` | The **arrival host → upstream base** map. The arrival host is the `Host` the caller targets on the server (`127.0.0.1:8080`, `llm.example.com`). The client appends the request path + query to the upstream base. Matching tries `host:port` first, then `host`. |
 | `id` | Optional client id; a random UUID is generated on startup if omitted. |

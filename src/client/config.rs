@@ -1,6 +1,6 @@
 //! Client configuration.
 
-use crate::client::connection::PING_INTERVAL_MS;
+use crate::client::connection::{PING_INTERVAL_MS, PROBE_DEADLINE};
 use crate::common::Rule;
 use crate::log;
 use std::collections::HashMap;
@@ -17,6 +17,14 @@ use std::path::Path;
 /// to the default (and logs a warning), so a too-small value degrades to
 /// "safe" instead of "broken".
 const MIN_LIVENESS_TIMEOUT_MS: i64 = 2 * PING_INTERVAL_MS;
+
+/// Minimum sane `healthcheckinterval` (ms): a health round probes every idle
+/// tunnel and waits up to the probe deadline (`PROBE_DEADLINE`, 10s) for the
+/// pong, so an interval below the deadline cannot finish a round before the
+/// next one is due — it would just chain rounds back-to-back. Below the
+/// floor the value falls back to the default (with a warning), mirroring
+/// `livenesstimeout`.
+const MIN_HEALTH_CHECK_INTERVAL_MS: i64 = PROBE_DEADLINE.as_millis() as i64;
 
 /// Configures a WSP client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -43,6 +51,19 @@ pub struct Config {
     /// `0` falls back to the default.
     #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
     pub liveness_timeout: i64,
+    /// Pool health-check interval (ms): how often the client runs a health
+    /// round — actively probe every idle tunnel (ping → pong), close the
+    /// unresponsive ones, print each tunnel's status, and refill the pool to
+    /// `poolidlesize` immediately. This is what guarantees the SERVER always
+    /// has usable tunnels: the passive liveness reaper needs up to
+    /// `livenesstimeout` to notice a dead link, and while a half-open tunnel
+    /// still LOOKS idle the demand-driven connector dials nothing — during
+    /// that window the server has no usable connection and requests fail
+    /// until the client is restarted. Must exceed the 10s probe deadline;
+    /// below the floor it falls back to the default and logs a warning.
+    /// `0` falls back to the default.
+    #[serde(rename = "healthcheckinterval", default = "default_health_check_interval")]
+    pub health_check_interval: i64,
     /// Upstream connect timeout (ms): bounds DNS + TCP + TLS for dialing a
     /// route's upstream. Caps the damage of a blackholed address (dropped
     /// SYNs would otherwise stall the request for the OS retransmit ladder).
@@ -123,6 +144,9 @@ fn default_pool_max_size() -> i64 {
 fn default_liveness_timeout() -> i64 {
     90000
 }
+fn default_health_check_interval() -> i64 {
+    30000
+}
 
 /// Create a new client config with default values (including a fresh UUID).
 pub fn new_config() -> Config {
@@ -132,6 +156,7 @@ pub fn new_config() -> Config {
         pool_idle_size: default_pool_idle_size(),
         pool_max_size: default_pool_max_size(),
         liveness_timeout: default_liveness_timeout(),
+        health_check_interval: default_health_check_interval(),
         // Timeouts are explicit-only: 0 (= unset) means "no limit". Nothing
         // is applied that the operator did not configure.
         connect_timeout: 0,
@@ -188,6 +213,22 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
             default_liveness_timeout()
         ));
         config.liveness_timeout = default_liveness_timeout();
+    }
+    // Same treatment for the health-check cadence: non-positive = "unset" ->
+    // default; a value below the probe deadline cannot complete a round
+    // before the next is due, so it also falls back (with a warning).
+    if config.health_check_interval <= 0 {
+        config.health_check_interval = default_health_check_interval();
+    } else if config.health_check_interval < MIN_HEALTH_CHECK_INTERVAL_MS {
+        log::log(format!(
+            "healthcheckinterval {}ms is below the minimum {}ms (a health round waits up to \
+             the {}ms probe deadline for every idle tunnel's pong); falling back to default {}ms",
+            config.health_check_interval,
+            MIN_HEALTH_CHECK_INTERVAL_MS,
+            MIN_HEALTH_CHECK_INTERVAL_MS,
+            default_health_check_interval()
+        ));
+        config.health_check_interval = default_health_check_interval();
     }
     // Timeouts (connecttimeout / upstreamtimeout / tunneltimeout /
     // streamidletimeout / upstreamidletimeout) are explicit-only: absent or
@@ -304,6 +345,37 @@ mod tests {
         assert_eq!(c.pool_idle_size, default_pool_idle_size());
         let c = load_with("poolmaxsize: -1");
         assert_eq!(c.pool_max_size, default_pool_max_size());
+    }
+
+    /// `healthcheckinterval` (client): cadence of the periodic pool health
+    /// round. Unset/0/negative -> default; below the 10s floor (a round
+    /// cannot meaningfully run faster than its own probe deadline) -> the
+    /// default too, with a warning; at/above the floor preserved as-is.
+    #[test]
+    fn health_check_interval_defaults_floor_and_preservation() {
+        let d = default_health_check_interval();
+        // Unset / 0 / negative -> default.
+        assert_eq!(load_with("").health_check_interval, d);
+        assert_eq!(load_with("healthcheckinterval: 0").health_check_interval, d);
+        assert_eq!(
+            load_with("healthcheckinterval: -1").health_check_interval,
+            d
+        );
+        // Below the floor -> default (probing faster than the probe deadline
+        // would just chain rounds back-to-back).
+        assert_eq!(
+            load_with("healthcheckinterval: 5000").health_check_interval,
+            d
+        );
+        // At the floor and above -> preserved.
+        assert_eq!(
+            load_with("healthcheckinterval: 10000").health_check_interval,
+            10_000
+        );
+        assert_eq!(
+            load_with("healthcheckinterval: 60000").health_check_interval,
+            60_000
+        );
     }
 
     #[test]

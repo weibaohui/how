@@ -1,8 +1,9 @@
 //! Client-side connection pool to a single WSP server target.
 
-use crate::client::connection::{Connection, Status};
+use crate::client::connection::{Connection, ProbeOutcome, Status, PROBE_DEADLINE};
 use crate::client::{ClientConfig, ClientInner};
 use crate::log;
+use futures::future::join_all;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -109,7 +110,8 @@ impl Pool {
         }
     }
 
-    /// Start the pool: connect once, then refresh every second.
+    /// Start the pool: connect once, then refresh every second, and run the
+    /// health round on its own cadence (`healthcheckinterval`, default 30s).
     pub fn start(self: Arc<Self>) {
         // connector() FIRST, then the stats snapshot: the freshly created
         // `Connecting` entries are captured by this tick's line instead of
@@ -117,18 +119,41 @@ impl Pool {
         // otherwise never show a connecting>0 state at all).
         self.connector();
         self.log_stats_if_changed();
-        let this = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = this.done.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        this.connector();
-                        this.log_stats_if_changed();
+        {
+            let this = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = this.done.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                            this.connector();
+                            this.log_stats_if_changed();
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
+        // Periodic health supervisor: actively verify every idle tunnel,
+        // close the unresponsive ones, and refill the pool immediately (see
+        // `health_round`). This is the guarantee the demand-driven connector
+        // alone cannot give: while a half-open tunnel still LOOKS idle, no
+        // replacement is dialed — the server then has nothing usable and the
+        // only fix used to be restarting the client.
+        {
+            let this = self.clone();
+            let interval =
+                Duration::from_millis(self.client.config.health_check_interval.max(1) as u64);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = this.done.cancelled() => break,
+                        _ = tokio::time::sleep(interval) => {
+                            this.health_round(PROBE_DEADLINE).await;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// Log "pool: N tunnels (connecting=X, idle=Y, running=Z)" whenever the
@@ -157,6 +182,128 @@ impl Pool {
         }
     }
 
+    /// One periodic health pass over the pool (run by the health loop spawned
+    /// in `start`, every `healthcheckinterval`):
+    ///
+    /// 1. Actively probe every Idle tunnel (ping + wait for the pong within
+    ///    `probe_deadline`) — concurrently, so the round takes ~RTT, not
+    ///    tunnels × RTT.
+    /// 2. Close and remove the tunnels that do not answer, and print each
+    ///    tunnel's status (verdict + pong age) — a wedged pool is then visible
+    ///    in the log instead of silently showing "10 idle".
+    /// 3. Dial the deficit to the target total so the pool always holds
+    ///    `pool_idle_size` VERIFIED-available tunnels (see the note at the
+    ///    dial site for why this is not delegated to the demand-driven
+    ///    connector).
+    ///
+    /// Running/Connecting tunnels are not probed (Running is demonstrably
+    /// exchanging data, see `Connection::probe`). The pool log line prints
+    /// every round — the "is my pool actually alive" heartbeat — while dead
+    /// tunnels get their own actionable line.
+    pub(crate) async fn health_round(&self, probe_deadline: Duration) {
+        // Snapshot under the lock, probe without it (probes sleep for up to
+        // `probe_deadline` and must not hold the pool hostage).
+        let mut idle_conns: Vec<Arc<Connection>> = Vec::new();
+        let (mut connecting, mut running) = (0usize, 0usize);
+        {
+            let conns = self.connections.lock().unwrap();
+            for conn in conns.iter() {
+                match conn.status() {
+                    Status::Idle => idle_conns.push(conn.clone()),
+                    Status::Connecting => connecting += 1,
+                    Status::Running => running += 1,
+                    Status::Closed => {}
+                }
+            }
+        }
+        let started = Instant::now();
+        let outcomes = join_all(idle_conns.iter().map(|conn| async move {
+            (conn.clone(), conn.probe(probe_deadline).await)
+        }))
+        .await;
+
+        let mut ok = 0usize;
+        let mut dead = 0usize;
+        let mut skipped = 0usize;
+        let mut status_line = String::new();
+        for (conn, outcome) in outcomes {
+            match outcome {
+                ProbeOutcome::Ok => {
+                    ok += 1;
+                    let pong_age = conn
+                        .last_pong()
+                        .map(|t| format!("{}s", t.elapsed().as_secs()))
+                        .unwrap_or_else(|| "-".to_string());
+                    status_line.push_str(&format!(" tunnel#{}:ok({pong_age})", conn.id()));
+                }
+                ProbeOutcome::Skipped => skipped += 1,
+                ProbeOutcome::Dead => {
+                    dead += 1;
+                    let last_pong = conn
+                        .last_pong()
+                        .map(|t| format!("{}s ago", t.elapsed().as_secs()))
+                        .unwrap_or_else(|| "never".to_string());
+                    log::log(format!(
+                        "pool health: tunnel#{} DEAD — no pong within {}ms (last pong: {last_pong}); \
+                         closing, connector re-establishing",
+                        conn.id(),
+                        probe_deadline.as_millis()
+                    ));
+                    // shutdown() removes the tunnel from the pool and scores
+                    // its lifecycle (a long-lived tunnel scores "stable", so
+                    // this normally also clears the dial backoff).
+                    conn.shutdown();
+                }
+            }
+        }
+        let target = (self.client.config.pool_idle_size.max(0) as usize)
+            .min(self.client.config.pool_max_size.max(0) as usize);
+        log::log(format!(
+            "pool health: idle={} ok={ok} dead={dead} skipped={skipped} connecting={connecting} \
+             running={running} target={target} |{} |round {}ms",
+            ok + dead + skipped,
+            status_line.trim_start(),
+            started.elapsed().as_millis()
+        ));
+        // Enforce the minimum AVAILABLE tunnel count here instead of
+        // delegating to the demand-driven connector: by design the connector
+        // never dials while ANY idle tunnel exists, so without this the pool
+        // would drift down one tunnel at a time as they die and only refill
+        // at zero — the "server has no connection" window this task exists
+        // to close. Available = verified-ok idle + skipped (not confirmed
+        // dead; the passive reaper still watches them) + connecting +
+        // running (busy tunnels return to idle).
+        let available = ok + skipped + connecting + running;
+        let deficit = target.saturating_sub(available);
+        if deficit == 0 {
+            return;
+        }
+        if self.in_backoff() {
+            // The backoff (up to 60s) throttles the 1s demand loop after
+            // consecutive dial failures — but if the pool has NOTHING left,
+            // waiting out the backoff leaves the server connection-less for
+            // up to a minute after it comes back. The health cadence (>=10s)
+            // is itself a gentle retry rate, so dial exactly ONE rescue
+            // tunnel per round: a failure retries no faster than the health
+            // interval; a success stabilizes after STABLE_LIFETIME, clears
+            // the backoff and lets the normal refill take over.
+            if available == 0 {
+                log::log(
+                    "pool health: pool empty while in dial backoff — dialing one rescue tunnel \
+                     at the health cadence"
+                        .to_string(),
+                );
+                self.dial(1);
+            }
+            return;
+        }
+        log::log(format!(
+            "pool health: {available}/{target} tunnels available — dialing {deficit} to restore \
+             the minimum"
+        ));
+        self.dial(deficit);
+    }
+
     /// Demand-driven connection creation (deliberately diverging from Go's
     /// standing-reserve `pool.connector`): prefer the connections already in
     /// the pool — while any idle tunnel exists, nothing is dialed. New
@@ -170,40 +317,52 @@ impl Pool {
         if self.in_backoff() {
             return;
         }
-        let mut conns = self.connections.lock().unwrap();
-        let size = self.size_locked(&conns);
+        // Scope the lock to the decision: dial() takes the same lock itself
+        // (a guard held across the call would self-deadlock on this
+        // non-reentrant Mutex — same pitfall as pool.shutdown).
+        let to_create: i64 = {
+            let conns = self.connections.lock().unwrap();
+            let size = self.size_locked(&conns);
 
-        // Prefer the connections already in the pool (demand-driven, not a
-        // standing reserve):
-        //   - ANY idle tunnel exists      -> never dial a new one; requests
-        //                                   are served from the pool.
-        //   - pool below the target TOTAL -> warm up. Busy tunnels count
-        //                                   toward the target, so concurrent
-        //                                   traffic no longer triggers
-        //                                   top-ups while idle ones remain.
-        //   - every tunnel busy, below    -> add one (capacity expansion on
-        //     pool_max_size                  real demand, capped).
-        // The warm-up target is clamped to pool_max_size (a misconfigured
-        // idle size above the max must not punch through the cap).
-        // Note for the expansion case: the new tunnel takes ~1 tick + RTT
-        // to register; callers wait at most the server's `timeout` for it —
-        // raise that if peak concurrency approaches pool_idle_size.
-        let max = self.client.config.pool_max_size.max(0) as usize;
-        let idle_target = (self.client.config.pool_idle_size.max(0) as usize).min(max);
-        let to_create: i64 = if size.idle > 0 {
-            0
-        } else if size.total < idle_target {
-            (idle_target - size.total) as i64
-        } else if size.total < max {
-            1
-        } else {
-            0
+            // Prefer the connections already in the pool (demand-driven, not
+            // a standing reserve):
+            //   - ANY idle tunnel exists      -> never dial a new one; requests
+            //                                   are served from the pool.
+            //   - pool below the target TOTAL -> warm up. Busy tunnels count
+            //                                   toward the target, so concurrent
+            //                                   traffic no longer triggers
+            //                                   top-ups while idle ones remain.
+            //   - every tunnel busy, below    -> add one (capacity expansion on
+            //     pool_max_size                  real demand, capped).
+            // The warm-up target is clamped to pool_max_size (a misconfigured
+            // idle size above the max must not punch through the cap).
+            // Note for the expansion case: the new tunnel takes ~1 tick + RTT
+            // to register; callers wait at most the server's `timeout` for
+            // it — raise that if peak concurrency approaches pool_idle_size.
+            let max = self.client.config.pool_max_size.max(0) as usize;
+            let idle_target = (self.client.config.pool_idle_size.max(0) as usize).min(max);
+            if size.idle > 0 {
+                0
+            } else if size.total < idle_target {
+                (idle_target - size.total) as i64
+            } else if size.total < max {
+                1
+            } else {
+                0
+            }
         };
         if to_create <= 0 {
             return;
         }
+        self.dial(to_create as usize);
+    }
 
-        for _ in 0..to_create {
+    /// Create `n` new tunnels: push a `Connecting` entry and spawn the
+    /// asynchronous dial (used by the demand-driven `connector` and by the
+    /// health round's minimum-availability top-up).
+    fn dial(&self, n: usize) {
+        let mut conns = self.connections.lock().unwrap();
+        for _ in 0..n {
             let conn = Connection::new(self.self_weak.clone());
             conns.push(conn.clone());
             let target = self.target.clone();
@@ -484,5 +643,160 @@ mod tests {
         );
         pool.connector(); // cold pool: warm-up, clamped to max
         assert_eq!(total(&pool), 100, "warm-up must stop at pool_max_size");
+    }
+
+    // ------------------------------------------------------------------
+    // Health round: the periodic pool supervisor (see `Pool::health_round`).
+    // The client-side counterpart of "make sure the server ALWAYS has usable
+    // tunnels": probe every idle tunnel, close the unresponsive ones, and
+    // trigger an immediate connector pass so replacements are dialed now,
+    // not on the next 1s tick.
+    // ------------------------------------------------------------------
+
+    /// Seed an ESTABLISHED idle tunnel (usable since long before now, so its
+    /// death scores "stable" and does not engage the dial backoff — mirrors
+    /// production, where a health-killed tunnel has usually lived for hours).
+    /// Without a wired probe writer it still fails the probe (Dead).
+    fn seed_established_idle(pool: &Arc<Pool>, n: usize, with_writer: bool) -> Vec<Arc<Connection>> {
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let mut seeded = Vec::new();
+        let mut conns = pool.connections.lock().unwrap();
+        for _ in 0..n {
+            let c = Connection::new(Arc::downgrade(pool));
+            c.set_status(Status::Idle);
+            let long_alive = Instant::now()
+                .checked_sub(Duration::from_secs(300))
+                .unwrap_or_else(Instant::now);
+            c.set_connected_at(Some(long_alive));
+            if with_writer {
+                let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                *c.probe_tx.lock().unwrap() = Some(tx);
+                // Fake server: answer every ping with a pong (recorded the
+                // way the driver records Message::Pong).
+                let responder = c.clone();
+                tokio::spawn(async move {
+                    while let Some(m) = rx.recv().await {
+                        if matches!(m, Message::Ping(_)) {
+                            responder.record_pong();
+                        }
+                    }
+                });
+            }
+            conns.push(c.clone());
+            seeded.push(c);
+        }
+        seeded
+    }
+
+    /// Unresponsive idle tunnels are closed and removed; running/connecting
+    /// tunnels are left alone; the connector immediately refills the pool to
+    /// the idle-size TOTAL (10) with new Connecting entries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_reaps_dead_idle_and_refills() {
+        let pool = dummy_pool();
+        seed_established_idle(&pool, 3, false); // dead: no writer, no pong
+        seed(&pool, 1, Status::Running);
+        seed(&pool, 1, Status::Connecting);
+
+        pool.health_round(Duration::from_millis(30)).await;
+
+        let conns = pool.connections.lock().unwrap();
+        let size = pool.size_locked(&conns);
+        assert_eq!(size.idle, 0, "unresponsive idle tunnels must be closed");
+        assert_eq!(size.running, 1, "running tunnels are never probed");
+        assert_eq!(
+            size.connecting,
+            1 + 8,
+            "connector must top the pool back up to idle_size total (10)"
+        );
+        assert_eq!(conns.len(), 10);
+    }
+
+    /// A tunnel that answers the probe is kept (this is the "never kill a
+    /// healthy tunnel" invariant — a false Dead here would drain the pool
+    /// every health round and reconnect-churn the server).
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_keeps_verified_tunnel() {
+        let pool = dummy_pool();
+        let healthy = seed_established_idle(&pool, 1, true);
+
+        // Generous probe deadline: a healthy tunnel answers in ~ms; the
+        // margin only absorbs a loaded test runner (a too-tight deadline
+        // would flake into a false Dead and kill the healthy tunnel).
+        pool.health_round(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            healthy[0].status(),
+            Status::Idle,
+            "a tunnel that pongs must survive the health round"
+        );
+        let conns = pool.connections.lock().unwrap();
+        assert!(conns.iter().any(|c| Arc::ptr_eq(c, &healthy[0])));
+        // Healthy idle exists -> connector only warms the total up to 10.
+        assert_eq!(conns.len(), 10);
+    }
+
+    /// While in dial backoff with an EMPTY pool (the server was down and has
+    /// just come back), the health round still dials exactly ONE rescue
+    /// tunnel: the exponential backoff (up to 60s) rightly throttles the 1s
+    /// demand loop, but leaving the server connection-less until the backoff
+    /// expires is exactly the outage this task exists to prevent. The health
+    /// cadence (>= 10s) itself bounds the retry rate, so this cannot hammer
+    /// the server.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_dials_one_rescue_tunnel_when_empty_in_backoff() {
+        let pool = dummy_pool();
+        pool.note_outcome(false); // 2s backoff, connector is blocked
+        assert!(pool.in_backoff());
+
+        pool.health_round(Duration::from_millis(10)).await;
+
+        assert_eq!(
+            total(&pool),
+            1,
+            "empty pool in backoff: exactly one rescue tunnel per health round"
+        );
+    }
+
+    /// With tunnels still available the backoff is respected (no dial): the
+    /// rescue path is only for a completely drained pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_respects_backoff_when_not_empty() {
+        let pool = dummy_pool();
+        seed(&pool, 1, Status::Running); // available (busy tunnels return)
+        pool.note_outcome(false);
+        assert!(pool.in_backoff());
+
+        pool.health_round(Duration::from_millis(10)).await;
+
+        assert_eq!(
+            total(&pool),
+            1,
+            "backoff with tunnels available: no dial until the backoff expires"
+        );
+    }
+
+    /// Killing dead tunnels during a health round must not leave the pool
+    /// below the minimum: the health task itself dials the deficit (available
+    /// = ok + skipped + connecting + running vs the target total) — the
+    /// demand-driven connector would dial NOTHING here, because a healthy
+    /// idle tunnel still exists (its "prefer existing connections" rule).
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_refills_only_the_deficit() {
+        let pool = dummy_pool();
+        seed_established_idle(&pool, 2, true); // healthy
+        seed_established_idle(&pool, 3, false); // dead
+
+        pool.health_round(Duration::from_millis(30)).await;
+
+        let conns = pool.connections.lock().unwrap();
+        let size = pool.size_locked(&conns);
+        assert_eq!(size.idle, 2, "verified tunnels survive");
+        assert_eq!(
+            size.connecting, 8,
+            "deficit vs the 10-tunnel target with 2 available = 8 dialed"
+        );
+        assert_eq!(conns.len(), 10, "total restored to the idle-size target");
     }
 }

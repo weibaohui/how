@@ -29,6 +29,14 @@ pub(crate) const CHECK_INTERVAL_MS: i64 = 10_000;
 /// two must change together.
 pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
 
+/// How long an active liveness probe (`Connection::probe`) waits for a pong
+/// before declaring the tunnel dead. Pongs are emitted by the server's
+/// driver directly (not by the request path), so a healthy link answers in
+/// ~RTT even under load; 10s is deliberately generous. This is also the
+/// floor for `healthcheckinterval` (a pool health round cannot meaningfully
+/// run faster than its own probe).
+pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A connection that lived past this long since a successful handshake counts
 /// as "stable" for the connector's failure backoff: its end resets the backoff.
 /// A connection that dies sooner (or never handshaked) counts as a failure —
@@ -67,6 +75,23 @@ pub enum Status {
     Closed = 3,
 }
 
+/// Outcome of an active liveness probe (`Connection::probe`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// A pong arrived after the probe ping was sent — the tunnel is verified
+    /// usable right now (frame reached the server, reply came back).
+    Ok,
+    /// An idle tunnel that stayed silent for the whole probe deadline (or
+    /// that cannot even send a ping) — dead or unanswerable, close it so the
+    /// connector dials a replacement.
+    Dead,
+    /// Cannot conclude — no action, and the passive keepalive reaper still
+    /// covers the tunnel: not Idle (Running is demonstrably exchanging data,
+    /// Connecting is not up yet, Closed is already gone) or the write queue
+    /// is momentarily full (mid-stream backpressure).
+    Skipped,
+}
+
 /// Monotonic tunnel IDs: every `Connection` gets a process-unique number so
 /// logs can be correlated — which tunnel served which request, which tunnel
 /// was reaped, which one died young. 1-based (0 would read as "unset").
@@ -93,6 +118,16 @@ pub struct Connection {
     /// arrives within ~RTT of each ping. If nothing arrives for
     /// `liveness_timeout`, the tunnel is dead and must be re-established.
     last_activity: Mutex<Instant>,
+    /// Last time a PONG was received from the server (`None` until the first
+    /// one). Refreshed by the driver on every `Message::Pong`; read by the
+    /// active liveness probe, which must see a pong arrive AFTER its own
+    /// ping was sent — any pong proves the round trip, including one
+    /// elicited by the regular keepalive ping.
+    last_pong: Mutex<Option<Instant>>,
+    /// Handle to the tunnel's write channel (set once the driver is up,
+    /// cleared on shutdown) so the pool's health round can inject probe
+    /// pings without owning the channel itself.
+    pub(crate) probe_tx: Mutex<Option<mpsc::Sender<Message>>>,
     /// When the tunnel became usable (handshake + greeting succeeded). `None`
     /// until then (or if connect failed before then). Used by `shutdown()` to
     /// tell a stable connection from one the server accepted then immediately
@@ -111,6 +146,8 @@ impl Connection {
             served: std::sync::atomic::AtomicU64::new(0),
             status: Mutex::new(Status::Connecting),
             last_activity: Mutex::new(Instant::now()),
+            last_pong: Mutex::new(None),
+            probe_tx: Mutex::new(None),
             connected_at: Mutex::new(None),
             cancel: CancellationToken::new(),
             self_weak: weak.clone(),
@@ -133,6 +170,26 @@ impl Connection {
     /// connection's lifecycle for the connector backoff).
     fn connected_at(&self) -> Option<Instant> {
         *self.connected_at.lock().unwrap()
+    }
+
+    /// Test support: overwrite the usable-since timestamp (production sets it
+    /// from `connect()`; tests backdate it to simulate an established tunnel
+    /// whose death must score as "stable").
+    #[cfg(test)]
+    pub(crate) fn set_connected_at(&self, t: Option<Instant>) {
+        *self.connected_at.lock().unwrap() = t;
+    }
+
+    /// Last time a pong was received from the server (`None` until the first
+    /// one); used by the health round to report each tunnel's pong age.
+    pub(crate) fn last_pong(&self) -> Option<Instant> {
+        *self.last_pong.lock().unwrap()
+    }
+
+    /// Record that a pong just arrived (called by the driver on every
+    /// `Message::Pong`; tests simulate one the same way).
+    pub(crate) fn record_pong(&self) {
+        *self.last_pong.lock().unwrap() = Some(Instant::now());
     }
 
     /// Dial the server and, on success, spawn the driver, serve and keepalive
@@ -207,6 +264,10 @@ impl Connection {
 
         let (read_tx, read_rx) = mpsc::channel::<Message>(8);
         let (write_tx, write_rx) = mpsc::channel::<Message>(8);
+        // Hand the pool's health round a way to inject probe pings. Set right
+        // here (before the greeting) so an Idle tunnel always carries a
+        // writer; cleared again by shutdown().
+        *self.probe_tx.lock().unwrap() = Some(write_tx.clone());
 
         let mut ws = ws;
         // greeting 发送也限时：握手后对端不消费数据时同样不能永久挂起。
@@ -288,6 +349,9 @@ impl Connection {
         if already {
             return;
         }
+        // Drop the probe writer first so a health round racing this shutdown
+        // cannot queue pings into a dead channel.
+        *self.probe_tx.lock().unwrap() = None;
         // Lifecycle summary: one line per tunnel death, with the id and what
         // it accomplished — pairs with the per-request "[tunnel#N …]" lines.
         let served = self.served.load(std::sync::atomic::Ordering::Relaxed);
@@ -317,6 +381,64 @@ impl Connection {
     }
     pub fn set_status(&self, s: Status) {
         *self.status.lock().unwrap() = s;
+    }
+
+    /// Actively verify this tunnel is usable RIGHT NOW: send a ping and wait
+    /// for a pong within `deadline`. Unlike the passive keepalive reaper
+    /// (which waits `liveness_timeout` for ANY frame and so needs minutes to
+    /// notice a dead link), a probe settles in ~RTT and turns "Idle by
+    /// status" into "verified available" — the basis of the pool's periodic
+    /// health round, which guarantees the server always has usable tunnels
+    /// instead of a pool of half-open ones the client still believes in.
+    ///
+    /// Only Idle tunnels are probed. A Running tunnel is demonstrably
+    /// exchanging data; a Connecting one is not up yet; a Closed one is
+    /// already gone — all Skipped. The verdict at the deadline re-checks the
+    /// status: if a request started during the probe (Idle -> Running) the
+    /// tunnel is alive and must not be killed, mirroring the TOCTOU re-check
+    /// in the keepalive reaper.
+    pub(crate) async fn probe(&self, deadline: Duration) -> ProbeOutcome {
+        if self.status() != Status::Idle {
+            return ProbeOutcome::Skipped;
+        }
+        // Any pong arriving at or after this instant proves the round trip —
+        // including one elicited by the regular keepalive ping, which proves
+        // exactly the same thing.
+        let started = Instant::now();
+        let sender = self.probe_tx.lock().unwrap().clone();
+        let Some(sender) = sender else {
+            // Idle tunnel with no writer: it can neither be probed nor serve
+            // a request (production always sets the writer in connect();
+            // only a broken/anomalous tunnel ends up here) — treat as dead.
+            return ProbeOutcome::Dead;
+        };
+        match sender.try_send(Message::Ping(bytes::Bytes::from_static(b"how-probe"))) {
+            Ok(()) => {}
+            // Queue full (a streamed response just finished filling it) or
+            // the driver side already dropped: inconclusive, never kill on a
+            // maybe — the passive keepalive reaper still covers this tunnel.
+            Err(mpsc::error::TrySendError::Full(_)) => return ProbeOutcome::Skipped,
+            Err(mpsc::error::TrySendError::Closed(_)) => return ProbeOutcome::Skipped,
+        }
+        // Poll for the pong: a healthy link answers in ~RTT, so poll finely
+        // (but never coarser than a quarter of the deadline).
+        let poll = (deadline / 4).min(Duration::from_millis(250));
+        let deadline_at = started + deadline;
+        loop {
+            if self.last_pong().is_some_and(|t| t >= started) {
+                return ProbeOutcome::Ok;
+            }
+            if Instant::now() >= deadline_at {
+                break;
+            }
+            tokio::time::sleep(poll).await;
+        }
+        // No pong in time. If a request started meanwhile the tunnel is
+        // exchanging data right now — do not kill it.
+        if self.status() != Status::Idle {
+            return ProbeOutcome::Skipped;
+        }
+        ProbeOutcome::Dead
     }
 }
 
@@ -366,7 +488,7 @@ async fn driver<S>(
                             Message::Ping(p) => {
                                 pending_pong = Some(p);
                             }
-                            Message::Pong(_) => {}
+                            Message::Pong(_) => conn.record_pong(),
                             Message::Close(_) => break,
                             mm => {
                                 if read_tx.send(mm).await.is_err() {
@@ -1050,5 +1172,108 @@ mod tests {
     #[test]
     fn outcome_fresh_connection_is_a_failure() {
         assert!(!is_stable_lifetime(Some(Instant::now().elapsed())));
+    }
+
+    /// Active liveness probes (`Connection::probe`) — the primitive behind
+    /// the pool's periodic health round. A probe sends a ping and verifies a
+    /// pong arrives afterwards; unlike the passive keepalive reaper (which
+    /// waits `livenesstimeout` for ANY frame), a probe settles in ~RTT and
+    /// turns "Idle by status" into "verified usable right now". These tests
+    /// wire a fake write channel (no real websocket) and simulate the
+    /// server's pong the way the driver records it.
+    mod probe {
+        use super::*;
+        use tokio::sync::mpsc;
+
+        /// Attach a write channel to a connection the way `connect()` does,
+        /// returning the receiving end (the fake "driver"/server side).
+        fn wire_probe_tx(conn: &Arc<Connection>) -> mpsc::Receiver<Message> {
+            let (tx, rx) = mpsc::channel::<Message>(8);
+            *conn.probe_tx.lock().unwrap() = Some(tx);
+            rx
+        }
+
+        /// A pong arriving after the probe ping was sent => Ok.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_reports_ok_when_pong_arrives() {
+            let pool = dummy_pool();
+            let conn = Connection::new(Arc::downgrade(&pool));
+            conn.set_status(Status::Idle);
+            let mut rx = wire_probe_tx(&conn);
+
+            let probing = conn.clone();
+            // 5s deadline: the happy path still settles in ~ms (the responder
+            // task runs at the first await); the margin only absorbs a
+            // heavily loaded test runner so the case never flakes.
+            let probe = tokio::spawn(async move { probing.probe(Duration::from_secs(5)).await });
+            // Fake server: the probe's ping arrives, then the pong comes back
+            // (the driver records it via record_pong).
+            let ping = rx.recv().await.expect("probe must send a ping");
+            assert!(
+                matches!(ping, Message::Ping(_)),
+                "probe must send a ping frame, got {ping:?}"
+            );
+            conn.record_pong();
+            assert_eq!(probe.await.unwrap(), ProbeOutcome::Ok);
+        }
+
+        /// No pong within the deadline => Dead.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_reports_dead_when_no_pong_arrives() {
+            let pool = dummy_pool();
+            let conn = Connection::new(Arc::downgrade(&pool));
+            conn.set_status(Status::Idle);
+            let _rx = wire_probe_tx(&conn); // never answers
+            assert_eq!(
+                conn.probe(Duration::from_millis(60)).await,
+                ProbeOutcome::Dead
+            );
+        }
+
+        /// Not Idle => Skipped: a Running tunnel is demonstrably exchanging
+        /// data, a Connecting one is not up yet, a Closed one is already gone.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_skips_non_idle_tunnels() {
+            let pool = dummy_pool();
+            for status in [Status::Running, Status::Connecting, Status::Closed] {
+                let conn = Connection::new(Arc::downgrade(&pool));
+                conn.set_status(status);
+                assert_eq!(
+                    conn.probe(Duration::from_millis(20)).await,
+                    ProbeOutcome::Skipped,
+                    "{status:?} must not be probed"
+                );
+            }
+        }
+
+        /// Idle tunnel with no writer (never went through `connect()`, or the
+        /// driver is gone) cannot be verified nor serve a request => Dead.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_reports_dead_without_writer() {
+            let pool = dummy_pool();
+            let conn = Connection::new(Arc::downgrade(&pool));
+            conn.set_status(Status::Idle);
+            assert_eq!(
+                conn.probe(Duration::from_millis(20)).await,
+                ProbeOutcome::Dead
+            );
+        }
+
+        /// Write queue momentarily full (a streamed response just finished
+        /// filling the shared buffer) => inconclusive: Skipped, never killed
+        /// on a maybe. The passive keepalive reaper still covers this tunnel.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_skips_when_write_queue_is_full() {
+            let pool = dummy_pool();
+            let conn = Connection::new(Arc::downgrade(&pool));
+            conn.set_status(Status::Idle);
+            let (tx, _rx) = mpsc::channel::<Message>(1); // never drained
+            *conn.probe_tx.lock().unwrap() = Some(tx.clone());
+            tx.try_send(Message::text("fill")).unwrap();
+            assert_eq!(
+                conn.probe(Duration::from_millis(20)).await,
+                ProbeOutcome::Skipped
+            );
+        }
     }
 }
