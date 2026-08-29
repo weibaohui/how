@@ -9,46 +9,45 @@
 //! forwarded transparently.
 
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// A child process that is killed (and waited on) when dropped, so the test
-/// never leaves a server running even on panic.
+/// never leaves a server running even on panic. Output goes to a per-process
+/// log file (both stdout and stderr appended; the binaries log to stderr)
+/// readable via [`Proc::log`] — files need no draining, unlike pipes.
 struct Proc {
     #[allow(dead_code)]
     name: &'static str,
+    log_path: String,
     child: Option<Child>,
 }
 
 impl Proc {
     fn spawn(name: &'static str, exe: &str, args: &[&str]) -> Self {
+        let log_path = format!("{}/{name}.log", tmpdir());
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap_or_else(|e| panic!("failed to open log for {name}: {e}"));
         let mut cmd = Command::new(exe);
         cmd.args(args);
-        let mut child = cmd
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
+        cmd.stdout(file.try_clone().expect("clone log fd"));
+        cmd.stderr(file);
+        let child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {name}: {e}"));
-        // Drain stderr/stdout so a chatty child (test_api logging a big body)
-        // cannot fill its OS pipe buffer (~64 KiB) and block.
-        if let Some(mut stderr) = child.stderr.take() {
-            std::thread::spawn(move || {
-                use std::io::Read;
-                let mut buf = [0u8; 4096];
-                while stderr.read(&mut buf).is_ok() {}
-            });
-        }
-        if let Some(mut stdout) = child.stdout.take() {
-            std::thread::spawn(move || {
-                use std::io::Read;
-                let mut buf = [0u8; 4096];
-                while stdout.read(&mut buf).is_ok() {}
-            });
-        }
         Proc {
             name,
+            log_path,
             child: Some(child),
         }
+    }
+
+    /// The child's accumulated output so far (stdout + stderr).
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
     }
 }
 
@@ -701,4 +700,51 @@ fn test_large_streamed_upload() {
     );
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.bytes().unwrap().as_ref(), blob.as_slice());
+}
+
+/// The observability contract: both ends log the SAME server-assigned tunnel
+/// number for the same connection, and every request line carries it. The
+/// client's `[tunnel#N …]` ids must each appear in the server's log too
+/// ("via tunnel#N" / "Registering new tunnel#N").
+#[test]
+fn test_tunnel_id_correlation() {
+    let env = setup(true, "");
+    let p = env.srv_port;
+    for _ in 0..2 {
+        let resp = http()
+            .get(format!("http://127.0.0.1:{p}/hello"))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+    let cli = env._client.log();
+    assert!(
+        cli.contains("Connected tunnel#"),
+        "client log lacks tunnel numbering:\n{cli}"
+    );
+    // Extract the tunnel numbers from the client's request lines.
+    let request_ids: Vec<String> = cli
+        .lines()
+        .filter(|l| l.contains("[tunnel#"))
+        .filter_map(|l| {
+            let rest = l.split("tunnel#").nth(1)?;
+            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (!num.is_empty()).then_some(num)
+        })
+        .collect();
+    assert!(
+        !request_ids.is_empty(),
+        "no [tunnel#N] request lines:\n{cli}"
+    );
+    let srv = env._server.log();
+    assert!(
+        srv.contains("via tunnel#"),
+        "server log lacks tunnel numbering:\n{srv}"
+    );
+    for id in &request_ids {
+        assert!(
+            srv.contains(&format!("tunnel#{id}")),
+            "client logged tunnel#{id} but the server never saw it — numbers diverged"
+        );
+    }
 }

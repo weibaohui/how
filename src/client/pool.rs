@@ -25,6 +25,12 @@ pub struct Pool {
     /// Deadline until which `connector()` refuses to dial. `None` when not
     /// backing off. Set by `note_outcome(false)`, cleared by `note_outcome(true)`.
     backoff_until: Mutex<Option<Instant>>,
+    /// Last pool-composition snapshot that was logged. The stats line prints
+    /// only when the composition CHANGES — keyed on (connecting, idle) only:
+    /// tunnel created / connected / closed. `running` is shown in the line
+    /// but deliberately NOT part of the key, so a request passing through
+    /// (Idle -> Running -> Idle) does not emit two extra lines each time.
+    last_stats: Mutex<Option<(usize, usize)>>,
 }
 
 /// Number of open connections per status.
@@ -52,6 +58,7 @@ impl Pool {
             self_weak: weak.clone(),
             failures: Mutex::new(0),
             backoff_until: Mutex::new(None),
+            last_stats: Mutex::new(None),
         })
     }
 
@@ -104,16 +111,50 @@ impl Pool {
 
     /// Start the pool: connect once, then refresh every second.
     pub fn start(self: Arc<Self>) {
+        // connector() FIRST, then the stats snapshot: the freshly created
+        // `Connecting` entries are captured by this tick's line instead of
+        // appearing only after they resolve (a sub-second connect would
+        // otherwise never show a connecting>0 state at all).
         self.connector();
+        self.log_stats_if_changed();
         let this = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = this.done.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => this.connector(),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        this.connector();
+                        this.log_stats_if_changed();
+                    }
                 }
             }
         });
+    }
+
+    /// Log "pool: N tunnels (connecting=X, idle=Y, running=Z)" whenever the
+    /// composition changes since the previous line (keyed on connecting/idle
+    /// only — see `last_stats`). Checked on the 1s tick, so a transition is
+    /// reflected at most one second after it happens.
+    fn log_stats_if_changed(&self) {
+        let (key, connecting, idle, running) = {
+            let conns = self.connections.lock().unwrap();
+            let size = self.size_locked(&conns);
+            (
+                (size.connecting, size.idle),
+                size.connecting,
+                size.idle,
+                size.running,
+            )
+        };
+        let mut last = self.last_stats.lock().unwrap();
+        if *last != Some(key) {
+            *last = Some(key);
+            let total = connecting + idle + running;
+            log::log(format!(
+                "pool: {total} tunnel{} (connecting={connecting}, idle={idle}, running={running})",
+                if total == 1 { "" } else { "s" }
+            ));
+        }
     }
 
     /// Ensure enough idle connections, up to `PoolMaxSize`. Create only one

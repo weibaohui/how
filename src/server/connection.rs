@@ -45,9 +45,25 @@ pub fn msg_binary(msg: &Message) -> Option<Bytes> {
     }
 }
 
+/// Monotonic server-assigned tunnel numbers. The SERVER is the single
+/// numbering authority — one global counter, so a number never duplicates
+/// across clients. The number is announced to the client in the handshake
+/// response header `X-TUNNEL-ID`; both ends then log the same `tunnel#N`
+/// for the same connection.
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Reserve the next tunnel number (`/register` does this when building the
+/// handshake response; the same number is then stored on the Connection).
+pub(crate) fn next_conn_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A single websocket connection offered by a remote WSP client.
 pub struct Connection {
     pub pool_id: String,
+    /// Server-assigned tunnel number (global, unique across all clients);
+    /// the client logs the same number for this connection.
+    pub id: u64,
     status: Mutex<Status>,
     idle_since: Mutex<Option<Instant>>,
     /// Last time any frame was received from the peer. Refreshed by the
@@ -67,6 +83,7 @@ impl Connection {
     /// itself to whenever it becomes idle.
     pub fn new<S>(
         pool_id: String,
+        id: u64,
         stream: WebSocketStream<S>,
         idle_tx: mpsc::Sender<Arc<Connection>>,
     ) -> Arc<Self>
@@ -82,6 +99,7 @@ impl Connection {
 
         let conn: Arc<Connection> = Arc::new_cyclic(|weak: &Weak<Connection>| Connection {
             pool_id: pool_id.clone(),
+            id,
             status: Mutex::new(Status::Idle),
             idle_since: Mutex::new(Some(Instant::now())),
             last_activity: Mutex::new(Instant::now()),
@@ -97,7 +115,10 @@ impl Connection {
             driver(conn_for_driver, stream, write_rx, read_tx, driver_cancel).await;
         });
 
-        log::log(format!("Registering new connection from {}", pool_id));
+        log::log(format!(
+            "Registering new tunnel#{} from {}",
+            conn.id, pool_id
+        ));
 
         // Offer the freshly idle connection to the dispatcher immediately,
         // mirroring Go's `connection.Release()` called from `NewConnection`.
@@ -179,7 +200,7 @@ impl Connection {
             }
             *s = Status::Closed;
         }
-        log::log(format!("Closing connection from {}", self.pool_id));
+        log::log(format!("Closing tunnel#{} from {}", self.id, self.pool_id));
         self.cancel.cancel();
     }
 
@@ -187,7 +208,10 @@ impl Connection {
     /// the websocket. The request body is sent separately as a stream of binary
     /// messages terminated by an empty binary end-marker.
     pub async fn send_request_header(&self, req: &HttpRequest) -> Result<(), String> {
-        log::log(format!("proxy request to {}", self.pool_id));
+        log::log(format!(
+            "proxy request to {} via tunnel#{}",
+            self.pool_id, self.id
+        ));
 
         let json_req = serde_json::to_string(req)
             .map_err(|e| format!("Unable to serialize request : {}", e))?;
