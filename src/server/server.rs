@@ -450,9 +450,7 @@ async fn handle_request(
                 }
             }
         }
-        conn.send_body_end()
-            .await
-            .map_err(|e| (e.clone(), e))?;
+        conn.send_body_end().await.map_err(|e| (e.clone(), e))?;
 
         // 接收响应头。远端 how-client 一拿到上游的 headers 就会立刻发回
         // （不等 body），因此调用方可以尽快得到状态码和 headers。

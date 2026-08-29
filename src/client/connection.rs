@@ -603,11 +603,8 @@ async fn serve(
                     e,
                     call_start.elapsed().as_millis()
                 ));
-                let _ = send_error(
-                    &write_tx,
-                    &format!("Unable to execute request : {}\n", e),
-                )
-                .await;
+                let _ =
+                    send_error(&write_tx, &format!("Unable to execute request : {}\n", e)).await;
                 continue;
             }
             Err(_elapsed) => {

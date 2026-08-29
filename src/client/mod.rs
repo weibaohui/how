@@ -3,11 +3,13 @@
 pub mod config;
 pub mod connection;
 pub mod pool;
+pub mod proxy;
 
 pub use config::{load_configuration, new_config, Config as ClientConfig};
 pub use connection::{Connection, Status};
 pub use pool::Pool;
 
+use crate::log;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,16 +44,72 @@ impl Client {
     /// - `pool_idle_timeout(90s)`：空闲连接超过 90 秒即丢弃，避免连接被
     ///   中间设备静默断开后，复用一条已经半开的连接导致再等一个超时。
     pub fn new(config: ClientConfig) -> Self {
+        // Outbound proxy: decide once, use everywhere. The same pure
+        // decision (proxy::decide) feeds the reqwest matcher below and the
+        // startup log, so what is printed is exactly how requests route.
+        // Previously reqwest silently followed http_proxy/https_proxy/
+        // all_proxy (including the uppercase HTTP_PROXY form curl ignores),
+        // which is how a proxy-less box ended up detouring upstream traffic.
+        let proxy_mode = proxy::ProxyMode::parse(&config.proxy);
+        let proxy_env = proxy::ProxyEnv::from_env();
+        let noproxy_cfg = config.noproxy.clone();
+
+        log::log(format!("Outbound proxy mode: {}", proxy_mode.describe()));
+        log::log(format!(
+            "  env: http_proxy={} https_proxy={} all_proxy={} no_proxy={}",
+            proxy_env.http.as_deref().unwrap_or("(unset)"),
+            proxy_env.https.as_deref().unwrap_or("(unset)"),
+            proxy_env.all.as_deref().unwrap_or("(unset)"),
+            proxy_env.no_proxy.as_deref().unwrap_or("(unset)"),
+        ));
+        if matches!(proxy_mode, proxy::ProxyMode::Env) && proxy_env.any_proxy_set() {
+            log::log(
+                "  WARNING: ambient proxy variables above are ACTIVE because no 'proxy' is set \
+                 in the config — upstream requests will go through them. Set 'proxy: none' \
+                 (always direct) or 'proxy: <url>' (explicit) to control this."
+                    .to_string(),
+            );
+        }
+
+        let matcher_mode = proxy_mode.clone();
+        let matcher_noproxy = noproxy_cfg.clone();
+        let matcher_env = proxy_env.clone();
+        let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .local_address(Some(Ipv4Addr::UNSPECIFIED.into()))
+            .proxy(reqwest::Proxy::custom(move |url| {
+                match proxy::decide(url.as_str(), &matcher_mode, &matcher_noproxy, &matcher_env) {
+                    proxy::Decision::Via(p) => Some(p),
+                    proxy::Decision::Direct(_) => None,
+                }
+            }))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        // Per-route decisions at startup: each route's upstream, and whether
+        // it will be reached via a proxy or directly (and why).
+        for (arrival, upstream) in &config.routes {
+            match proxy::decide(upstream, &proxy_mode, &noproxy_cfg, &proxy_env) {
+                proxy::Decision::Via(p) => {
+                    log::log(format!("route {arrival} -> {upstream} : VIA PROXY {p}"));
+                }
+                proxy::Decision::Direct(reason) => {
+                    log::log(format!("route {arrival} -> {upstream} : direct ({reason})"));
+                }
+            }
+        }
+        log::log(
+            "outbound pinned to IPv4 (local_address 0.0.0.0): a broken-IPv6 environment \
+             skips the 20-30s SYN-timeout fallback"
+                .to_string(),
+        );
+
         let inner = Arc::new(ClientInner {
             config: Arc::new(config),
-            http_client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::limited(10))
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(60))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .local_address(Some(Ipv4Addr::UNSPECIFIED.into()))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            http_client,
         });
         Client {
             inner,

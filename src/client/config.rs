@@ -49,6 +49,23 @@ pub struct Config {
     pub blacklist: Vec<Rule>,
     #[serde(rename = "secretkey", default)]
     pub secret_key: String,
+    /// Outbound proxy for upstream requests. Unset (empty) = follow the
+    /// ambient http_proxy/https_proxy/all_proxy variables (backwards
+    /// compatible; a startup WARNING is logged when any is set — reqwest
+    /// honors the uppercase HTTP_PROXY form that curl ignores, a classic
+    /// "curl is fast, the client program is slow" trap). "none" = always
+    /// connect directly, env ignored. A URL like "http://127.0.0.1:7890" =
+    /// use exactly that proxy for every upstream, env ignored. Each route's
+    /// decision is printed at startup.
+    #[serde(rename = "proxy", default)]
+    pub proxy: String,
+    /// Upstream hosts that must bypass the proxy even when one is active
+    /// (matched against the route's upstream address, not the arrival host):
+    /// exact host ("api.corp"), host:port ("api.corp:8443"), or domain
+    /// suffix (".corp" / "*.corp" / "corp"). Comma-separated NO_PROXY-style
+    /// entries also work.
+    #[serde(rename = "noproxy", default)]
+    pub noproxy: Vec<String>,
     /// Route map: arrival host (the Host the caller targets on the server,
     /// e.g. "127.0.0.1:8080" or "llm.example.com") -> upstream base URL
     /// (e.g. "https://ecloud.10086.cn/api/query/aigateway"). The client
@@ -85,6 +102,8 @@ pub fn new_config() -> Config {
         whitelist: Vec::new(),
         blacklist: Vec::new(),
         secret_key: String::new(),
+        proxy: String::new(),
+        noproxy: Vec::new(),
         routes: HashMap::new(),
     }
 }
@@ -132,6 +151,16 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     }
     for rule in config.blacklist.iter_mut() {
         rule.compile().map_err(|e| e.to_string())?;
+    }
+    // An explicit proxy must be an http(s) URL (socks support is not compiled
+    // in). "none"/empty already parsed into a mode by the time this matters;
+    // a bogus value would otherwise fail every request at dial time.
+    let p = config.proxy.trim();
+    if !p.is_empty() && !p.eq_ignore_ascii_case("none") && !p.starts_with("http") {
+        log::log(format!(
+            "proxy '{p}' does not look like an http(s):// URL; the client only supports \
+             HTTP proxies — treating it as-is anyway, expect upstream failures if it is wrong"
+        ));
     }
     Ok(config)
 }
