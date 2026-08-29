@@ -644,6 +644,49 @@ fn test_streaming_response() {
     });
 }
 
+/// Regression: a streaming response that keeps FLOWING for longer than every
+/// proxy-side timeout must complete — none of them may bound a live stream.
+/// The stream runs ~68s: past the client's 60s read_timeout (per-read stall
+/// detection — it must NOT act while data keeps arriving) and past both
+/// 30s upstream timeouts (they cover only up to the response HEADERS). Under
+/// the old client-level total `timeout(60s)` this stream was truncated
+/// mid-body (reqwest: "until the response body has finished"), which is
+/// exactly the LLM-SSE failure this test pins.
+#[test]
+fn test_long_stream_survives_timeouts() {
+    let env = setup(true, "");
+    let p = env.srv_port;
+    // 170 chunks x 400ms = 68s of continuously arriving data.
+    let url = format!("http://127.0.0.1:{p}/stream?chunks=170");
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("no-proxy client");
+        let resp = client.get(&url).send().await.expect("stream req");
+        assert_eq!(resp.status().as_u16(), 200);
+        let t0 = Instant::now();
+        let mut all = String::new();
+        use futures::StreamExt;
+        let mut s = resp.bytes_stream();
+        while let Some(chunk) = s.next().await {
+            let b = chunk.expect("stream died mid-body — truncated by a total timeout?");
+            all.push_str(&String::from_utf8_lossy(&b));
+        }
+        let total = t0.elapsed();
+        // The full stream must have arrived: every token and the DONE marker.
+        for i in 0..169 {
+            assert!(all.contains(&format!("tok-{i}")), "missing tok-{i}");
+        }
+        assert!(all.contains("[DONE]"), "stream truncated before [DONE]");
+        assert!(
+            total.as_secs() >= 60,
+            "stream finished too early — was it really 170 chunks? {total:?}"
+        );
+    });
+}
+
 #[test]
 fn test_large_streamed_upload() {
     let env = setup(true, "");

@@ -550,16 +550,16 @@ async fn serve(
         // producer 结束（读到空 end-marker）时 body_tx 被 drop，reqwest 就知
         // 道请求体结束了；read_rx 是借用所以 serve 循环继续持有它。
         //
-        // 额外加一层 30s 的上游调用超时：
-        // 虽然 Client::new 里已经给 reqwest 设置了 timeout，但那是从发出
-        // 请求到 body 读完的"总"超时。这里在 send 这一层再包一次显式超时
-        // 并打印耗时日志，目的是：
+        // 额外加一层上游调用超时（`upstreamtimeout` 配置，默认 30s）：
+        // 只覆盖"发出请求 → 收到响应头"这一段，响应 body 在其之后流式回传、
+        // 不受它限制（流式响应由 reqwest 的 read_timeout 做停滞检测，只要
+        // 还在出数据就永不截断）。包这一层并打印耗时日志的目的是：
         //   1) 下次再遇到慢请求时，日志里能立刻看到是"上游建立连接慢"
-        //      还是"上游返回数据慢"（和 Client 总超时配合双重兜底）；
+        //      还是"上游返回数据慢"；
         //   2) 遇到配置错误等特殊情况导致 reqwest 内部 timeout 失效时，
         //      仍能保证不会无限挂住一条 Running 连接（Running 连接会阻止
         //      keepalive 的半开回收逻辑，长时间挂死会把池子拖没）。
-        let upstream_call_deadline = Duration::from_secs(30);
+        let upstream_call_deadline = Duration::from_millis(config.upstream_timeout as u64);
         let (body_tx, body_rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
         let req_body =
             reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx));

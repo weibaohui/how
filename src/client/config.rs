@@ -43,6 +43,19 @@ pub struct Config {
     /// `0` falls back to the default.
     #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
     pub liveness_timeout: i64,
+    /// Upstream connect timeout (ms): bounds DNS + TCP + TLS for dialing a
+    /// route's upstream. Caps the damage of a blackholed address (dropped
+    /// SYNs would otherwise stall the request for the OS retransmit ladder).
+    /// Default 5000. `0`/negative falls back to the default.
+    #[serde(rename = "connecttimeout", default = "default_connect_timeout")]
+    pub connect_timeout: i64,
+    /// Upstream call deadline (ms): from sending the request to the upstream
+    /// until its response HEADERS arrive (the body then streams unbounded —
+    /// a slow but flowing SSE stream is never cut; a stalled one is caught
+    /// by the stream idle timeout instead). Bounds the time-to-first-byte a
+    /// caller waits. Default 30000. `0`/negative falls back to the default.
+    #[serde(rename = "upstreamtimeout", default = "default_upstream_timeout")]
+    pub upstream_timeout: i64,
     #[serde(default)]
     pub whitelist: Vec<Rule>,
     #[serde(default)]
@@ -90,6 +103,12 @@ fn default_pool_max_size() -> i64 {
 fn default_liveness_timeout() -> i64 {
     90000
 }
+fn default_connect_timeout() -> i64 {
+    5000
+}
+fn default_upstream_timeout() -> i64 {
+    30000
+}
 
 /// Create a new client config with default values (including a fresh UUID).
 pub fn new_config() -> Config {
@@ -99,6 +118,8 @@ pub fn new_config() -> Config {
         pool_idle_size: default_pool_idle_size(),
         pool_max_size: default_pool_max_size(),
         liveness_timeout: default_liveness_timeout(),
+        connect_timeout: default_connect_timeout(),
+        upstream_timeout: default_upstream_timeout(),
         whitelist: Vec::new(),
         blacklist: Vec::new(),
         secret_key: String::new(),
@@ -145,6 +166,25 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
             default_liveness_timeout()
         ));
         config.liveness_timeout = default_liveness_timeout();
+    }
+    // Same "non-positive = unset" rule as livenesstimeout: a negative would
+    // panic on the Duration conversion and a zero would disable a guard that
+    // exists to bound stuck upstreams.
+    if config.connect_timeout <= 0 {
+        log::log(format!(
+            "connecttimeout {}ms is not positive; falling back to default {}ms",
+            config.connect_timeout,
+            default_connect_timeout()
+        ));
+        config.connect_timeout = default_connect_timeout();
+    }
+    if config.upstream_timeout <= 0 {
+        log::log(format!(
+            "upstreamtimeout {}ms is not positive; falling back to default {}ms",
+            config.upstream_timeout,
+            default_upstream_timeout()
+        ));
+        config.upstream_timeout = default_upstream_timeout();
     }
     for rule in config.whitelist.iter_mut() {
         rule.compile().map_err(|e| e.to_string())?;
@@ -212,5 +252,34 @@ mod tests {
         assert_eq!(c.liveness_timeout, MIN_LIVENESS_TIMEOUT_MS);
         let c = load_with("livenesstimeout: 120000");
         assert_eq!(c.liveness_timeout, 120_000);
+    }
+
+    #[test]
+    fn upstream_timeouts_non_positive_fall_back_to_default() {
+        // 0 / negative / unset connecttimeout & upstreamtimeout -> defaults.
+        for key in ["connecttimeout", "upstreamtimeout"] {
+            let c = load_with(&format!("{key}: 0"));
+            let c2 = load_with(&format!("{key}: -5"));
+            match key {
+                "connecttimeout" => {
+                    assert_eq!(c.connect_timeout, default_connect_timeout());
+                    assert_eq!(c2.connect_timeout, default_connect_timeout());
+                }
+                _ => {
+                    assert_eq!(c.upstream_timeout, default_upstream_timeout());
+                    assert_eq!(c2.upstream_timeout, default_upstream_timeout());
+                }
+            }
+        }
+        let c = load_with("");
+        assert_eq!(c.connect_timeout, default_connect_timeout());
+        assert_eq!(c.upstream_timeout, default_upstream_timeout());
+    }
+
+    #[test]
+    fn upstream_timeouts_positive_values_are_preserved() {
+        let c = load_with("connecttimeout: 2000\nupstreamtimeout: 45000");
+        assert_eq!(c.connect_timeout, 2000);
+        assert_eq!(c.upstream_timeout, 45_000);
     }
 }

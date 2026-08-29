@@ -62,12 +62,26 @@ async fn sleep(_req: Request<Incoming>) -> Result<Response<Boxed>, Infallible> {
 }
 
 /// An SSE streaming endpoint that mimics an OpenAI-style `text/event-stream`
-/// response: it emits a `data:` chunk every 400ms and a final `[DONE]`.
-async fn stream(_req: Request<Incoming>) -> Result<Response<Boxed>, Infallible> {
-    let s = stream::unfold(0u32, |i| async move {
-        if i < 6 {
+/// response: it emits a `data:` chunk every 400ms and a final `[DONE]`. The
+/// chunk count is settable via `?chunks=` (default 6, i.e. ~2.4s) so tests
+/// can produce streams longer than any proxy-side timeout (e.g. 170 chunks
+/// ≈ 68s to prove a flowing stream is never truncated by a total deadline).
+async fn stream(req: Request<Incoming>) -> Result<Response<Boxed>, Infallible> {
+    let chunks: u32 = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&').find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                (k == "chunks").then(|| v.parse::<u32>().ok())?
+            })
+        })
+        .unwrap_or(6)
+        .clamp(1, 100_000);
+    let s = stream::unfold(0u32, move |i| async move {
+        if i < chunks {
             tokio::time::sleep(Duration::from_millis(400)).await;
-            let chunk = if i < 5 {
+            let chunk = if i + 1 < chunks {
                 format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"tok-{i}\"}}}}]}}\n\n")
             } else {
                 "data: [DONE]\n\n".to_string()

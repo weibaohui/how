@@ -39,8 +39,12 @@ impl Client {
     /// - `local_address(0.0.0.0)`：绑定 IPv4 源地址，底层仅解析并尝试 IPv4，
     ///   彻底跳过 IPv6 回退等待。若后续环境确实需要 IPv6，可去掉这一行并
     ///   改依赖 `trust-dns` 实现 Happy Eyeballs。
-    /// - `timeout(60s)`：从发出请求到读完响应头+body 的总兜底超时，避免
-    ///   慢上游把连接永久占死。按业务需求可再调大。
+    /// - `timeout(60s)`：已改为 `read_timeout(60s)`（按"每次读取"计的停滞
+    ///   检测，不是总期限）：流式响应只要还在持续出数据就永不截断，而彻底
+    ///   停止发送的连接在 60s 内死亡，不会挂死 Running 隧道。总期限会截断
+    ///   超过它的 SSE 长流（reqwest 语义是"直到 body 结束"），对 LLM 代理
+    ///   是错误的取舍。上游调用的"到响应头为止"期限由 `upstreamtimeout`
+    ///   配置（默认 30s），在 serve 循环里单独包裹。
     /// - `pool_idle_timeout(90s)`：空闲连接超过 90 秒即丢弃，避免连接被
     ///   中间设备静默断开后，复用一条已经半开的连接导致再等一个超时。
     pub fn new(config: ClientConfig) -> Self {
@@ -74,10 +78,17 @@ impl Client {
         let matcher_mode = proxy_mode.clone();
         let matcher_noproxy = noproxy_cfg.clone();
         let matcher_env = proxy_env.clone();
-        let http_client = reqwest::Client::builder()
+        let http_client = match reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_millis(config.connect_timeout as u64))
+            // Per-read stall detection, NOT a total deadline: a slow but
+            // flowing SSE stream runs as long as it keeps flowing, while a
+            // connection that stops sending dies here instead of hanging a
+            // Running tunnel forever. (A client-level `timeout()` would cap
+            // the WHOLE response — reqwest: "until the response body has
+            // finished" — and truncate every stream longer than it, which
+            // is exactly the wrong trade for an LLM proxy.)
+            .read_timeout(Duration::from_secs(60))
             .pool_idle_timeout(Duration::from_secs(90))
             .local_address(Some(Ipv4Addr::UNSPECIFIED.into()))
             .proxy(reqwest::Proxy::custom(move |url| {
@@ -87,7 +98,16 @@ impl Client {
                 }
             }))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::log(format!(
+                    "reqwest client build failed ({e}); falling back to a default client — \
+                     proxy rules, timeouts and the IPv4 pin are LOST in this mode"
+                ));
+                reqwest::Client::new()
+            }
+        };
 
         // Per-route decisions at startup: each route's upstream, and whether
         // it will be reached via a proxy or directly (and why).
