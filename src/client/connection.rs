@@ -195,7 +195,13 @@ impl Connection {
 
         // Serve: reads requests, executes them, writes responses.
         let serve_conn = this.clone();
-        tokio::spawn(serve(serve_conn, read_rx, write_tx.clone(), http_client, config));
+        tokio::spawn(serve(
+            serve_conn,
+            read_rx,
+            write_tx.clone(),
+            http_client,
+            config,
+        ));
 
         // Keepalive: send a ping every 30s (keeps NAT/firewall idle timers
         // from dropping the tunnel) and reap the connection when no frame at
@@ -486,11 +492,8 @@ async fn serve(
             Ok(u) => u,
             Err(e) => {
                 let _ = discard_body(&mut read_rx).await;
-                let _ = send_error(
-                    &write_tx,
-                    &format!("Unable to parse request url : {}\n", e),
-                )
-                .await;
+                let _ =
+                    send_error(&write_tx, &format!("Unable to parse request url : {}\n", e)).await;
                 continue;
             }
         };
@@ -547,11 +550,9 @@ async fn serve(
         // with send() (which pulls the stream). `body_tx` is owned by the
         // producer so it is dropped when the body ends, signalling end-of-body
         // to reqwest; `read_rx` is borrowed so the serve loop keeps it.
-        let (body_tx, body_rx) =
-            mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
-        let req_body = reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(
-            body_rx,
-        ));
+        let (body_tx, body_rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
+        let req_body =
+            reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx));
         let reqwest_req = http_client
             .request(method, url)
             .headers(headers)
@@ -574,11 +575,8 @@ async fn serve(
         let resp = match tokio::join!(producer, reqwest_req.send()).1 {
             Ok(r) => r,
             Err(e) => {
-                let _ = send_error(
-                    &write_tx,
-                    &format!("Unable to execute request : {}\n", e),
-                )
-                .await;
+                let _ =
+                    send_error(&write_tx, &format!("Unable to execute request : {}\n", e)).await;
                 continue;
             }
         };
@@ -653,10 +651,7 @@ async fn serve(
 
 /// Check the client's blacklist/whitelist against a request. Returns the
 /// denial reason if the request must be denied, else `None`.
-fn check_rules(
-    config: &crate::client::ClientConfig,
-    req: &HttpRequest,
-) -> Option<String> {
+fn check_rules(config: &crate::client::ClientConfig, req: &HttpRequest) -> Option<String> {
     if !config.blacklist.is_empty() {
         for rule in &config.blacklist {
             if rule.matches(&req.method, &req.url, &req.header) {
@@ -706,7 +701,10 @@ async fn send_error(write_tx: &mpsc::Sender<Message>, msg: &str) -> Result<(), (
         .await
         .map_err(|_| ())?;
     // End-of-body marker.
-    write_tx.send(Message::binary(Vec::new())).await.map_err(|_| ())?;
+    write_tx
+        .send(Message::binary(Vec::new()))
+        .await
+        .map_err(|_| ())?;
     Ok(())
 }
 

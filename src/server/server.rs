@@ -60,8 +60,7 @@ fn proxy_error_response(msg: &str) -> Response<Boxed> {
     log::log(msg.to_string());
     Response::builder()
         .status(
-            StatusCode::from_u16(proxy_error_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::from_u16(proxy_error_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         )
         .body(Full::new(Bytes::copy_from_slice(msg.as_bytes())).boxed())
         .unwrap()
@@ -109,7 +108,9 @@ impl Server {
         let addr: SocketAddr = format!("{}:{}", self.inner.config.host, self.inner.config.port)
             .parse()
             .map_err(|e| format!("Invalid bind address : {}", e))?;
-        let listener = TcpListener::bind(addr).await.map_err(|e| format!("{}", e))?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("{}", e))?;
         log::log(format!(
             "WSP server listening on {}:{}",
             self.inner.config.host, self.inner.config.port
@@ -178,7 +179,12 @@ fn clean(inner: &Arc<Inner>) {
             kept.push(pool);
         }
     }
-    log::log(format!("{} pools, {} idle, {} busy", kept.len(), idle, busy));
+    log::log(format!(
+        "{} pools, {} idle, {} busy",
+        kept.len(),
+        idle,
+        busy
+    ));
     *pools = kept;
 }
 
@@ -249,7 +255,7 @@ fn handle_status() -> Response<Boxed> {
 fn build_request(
     inner: &Arc<Inner>,
     req: &Request<Incoming>,
-) -> Result<HttpRequest, Response<Boxed>> {
+) -> Result<HttpRequest, Box<Response<Boxed>>> {
     // Reconstruct the arrival URL from the Host header + the request path.
     // The client routes it (arrival host -> configured upstream) and appends
     // the path; the real destination is never carried in a request header.
@@ -267,7 +273,7 @@ fn build_request(
     if !inner.config.allowed_hosts.is_empty() {
         let hostname = host_name(&host);
         if hostname.parse::<std::net::IpAddr>().is_ok() {
-            return Err(forbidden("Host must be a domain, not an IP"));
+            return Err(Box::new(forbidden("Host must be a domain, not an IP")));
         }
         let allowed = inner
             .config
@@ -275,12 +281,18 @@ fn build_request(
             .iter()
             .any(|h| h.eq_ignore_ascii_case(&hostname));
         if !allowed {
-            return Err(forbidden(&format!("Host not allowed: {hostname}")));
+            return Err(Box::new(forbidden(&format!(
+                "Host not allowed: {hostname}"
+            ))));
         }
     }
 
     let path = req.uri().path();
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let url = format!("http://{host}{path}{query}");
 
     // Forward all headers transparently (Authorization, Content-Type, custom).
@@ -328,9 +340,7 @@ fn host_name(host_header: &str) -> String {
         }
     }
     // Strip IPv6 brackets, e.g. "[::1]" -> "::1".
-    h.trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string()
+    h.trim_start_matches('[').trim_end_matches(']').to_string()
 }
 
 /// Build a 403 Forbidden response with a message body.
@@ -380,7 +390,7 @@ async fn handle_request(
 
     let http_req = match build_request(&inner, &req) {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // No proxy available.
@@ -407,7 +417,7 @@ async fn handle_request(
     // Stream the request body to the remote client frame by frame (one binary
     // message per upstream frame) and finish with an empty end-marker.
     if let Err(e) = conn.send_request_header(&http_req).await {
-        log::log(format!("{}", e));
+        log::log(e.to_string());
         conn.close();
         return proxy_error_response(&e);
     }
@@ -428,7 +438,7 @@ async fn handle_request(
                     continue;
                 }
                 if let Err(e) = conn.send_body_chunk(data.clone()).await {
-                    log::log(format!("{}", e));
+                    log::log(e.to_string());
                     conn.close();
                     return proxy_error_response(&e);
                 }
@@ -436,7 +446,7 @@ async fn handle_request(
         }
     }
     if let Err(e) = conn.send_body_end().await {
-        log::log(format!("{}", e));
+        log::log(e.to_string());
         conn.close();
         return proxy_error_response(&e);
     }
@@ -447,7 +457,7 @@ async fn handle_request(
     let http_resp = match conn.recv_response_header().await {
         Ok(h) => h,
         Err(e) => {
-            log::log(format!("{}", e));
+            log::log(e.to_string());
             conn.close();
             return proxy_error_response(&e);
         }
@@ -526,8 +536,7 @@ async fn handle_register(inner: Arc<Inner>, req: Request<Incoming>) -> Response<
             }
         };
         let io = TokioIo::new(upgraded);
-        let ws =
-            WebSocketStream::from_raw_socket(io, Role::Server, None).await;
+        let ws = WebSocketStream::from_raw_socket(io, Role::Server, None).await;
         register_websocket(inner_clone, ws).await;
     });
 

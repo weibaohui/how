@@ -28,7 +28,9 @@ fn boxed(b: Full<Bytes>) -> Boxed {
 
 async fn hello(_req: Request<Incoming>) -> Result<Response<Boxed>, Infallible> {
     how::log::log_plain("hello");
-    Ok(Response::new(boxed(Full::new(Bytes::from_static(b"hello world\n")))))
+    Ok(Response::new(boxed(Full::new(Bytes::from_static(
+        b"hello world\n",
+    )))))
 }
 
 async fn header(_req: Request<Incoming>) -> Result<Response<Boxed>, Infallible> {
@@ -115,9 +117,7 @@ async fn chat_completions(req: Request<Incoming>) -> Result<Response<Boxed>, Inf
     let body = req.into_body().collect().await.unwrap().to_bytes();
     let n = body.len();
     let stream = std::str::from_utf8(&body)
-        .map(|s| {
-            s.contains("\"stream\":true") || s.contains("\"stream\": true")
-        })
+        .map(|s| s.contains("\"stream\":true") || s.contains("\"stream\": true"))
         .unwrap_or(false);
     how::log::log_plain(format!("chat_completions bytes={} stream={}", n, stream));
     if stream {

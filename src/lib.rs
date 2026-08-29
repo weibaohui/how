@@ -10,8 +10,8 @@
 //! request locally and streams the response back. No buffering of any sort
 //! is intended.
 
+pub mod cli;
+pub mod client;
 pub mod common;
 pub mod log;
-pub mod cli;
 pub mod server;
-pub mod client;

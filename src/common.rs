@@ -20,7 +20,7 @@ pub struct HttpRequest {
 }
 
 /// A serializable version of `http::Response` (only the useful fields).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HttpResponse {
     #[serde(rename = "StatusCode", default)]
     pub status_code: u16,
@@ -28,16 +28,6 @@ pub struct HttpResponse {
     pub header: HashMap<String, Vec<String>>,
     #[serde(rename = "ContentLength", default)]
     pub content_length: i64,
-}
-
-impl Default for HttpResponse {
-    fn default() -> Self {
-        Self {
-            status_code: 0,
-            header: HashMap::new(),
-            content_length: 0,
-        }
-    }
 }
 
 /// Create a new empty `HttpResponse` (with an initialized header map).
@@ -100,7 +90,8 @@ impl Rule {
         self.headers_re.clear();
         for (header, regex_str) in &self.headers {
             let regex = Regex::new(regex_str)?;
-            self.headers_re.insert(header.clone(), (regex_str.clone(), regex));
+            self.headers_re
+                .insert(header.clone(), (regex_str.clone(), regex));
         }
         Ok(())
     }

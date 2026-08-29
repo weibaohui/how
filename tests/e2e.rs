@@ -45,7 +45,10 @@ impl Proc {
                 while stdout.read(&mut buf).is_ok() {}
             });
         }
-        Proc { name, child: Some(child) }
+        Proc {
+            name,
+            child: Some(child),
+        }
     }
 }
 
@@ -136,9 +139,8 @@ fn tmpdir() -> String {
 fn bin(name: &str) -> String {
     // cargo exposes CARGO_BIN_EXE_<name> with hyphens replaced by underscores.
     let env = format!("CARGO_BIN_EXE_{}", name.replace('-', "_"));
-    std::env::var(&env).unwrap_or_else(|_| {
-        format!("{}/target/debug/{name}", env!("CARGO_MANIFEST_DIR"))
-    })
+    std::env::var(&env)
+        .unwrap_or_else(|_| format!("{}/target/debug/{name}", env!("CARGO_MANIFEST_DIR")))
 }
 
 fn http() -> reqwest::blocking::Client {
@@ -186,12 +188,17 @@ fn setup(route_to_api: bool, extra_client: &str) -> Env {
     let srv_port = free_port();
     let api_base = format!("http://127.0.0.1:{api_port}");
 
-    let _api = Proc::spawn("test_api", &bin("how-test-api"), &["-addr", &format!("127.0.0.1:{api_port}")]);
+    let _api = Proc::spawn(
+        "test_api",
+        &bin("how-test-api"),
+        &["-addr", &format!("127.0.0.1:{api_port}")],
+    );
 
     let srv_cfg = format!("{dir}/server.cfg");
-    write_cfg(&srv_cfg, &format!(
-        "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n"
-    ));
+    write_cfg(
+        &srv_cfg,
+        &format!("---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n"),
+    );
     let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
     wait_for_server(srv_port);
 
@@ -199,7 +206,9 @@ fn setup(route_to_api: bool, extra_client: &str) -> Env {
         "---\ntargets:\n - ws://127.0.0.1:{srv_port}/register\npoolidlesize: 2\npoolmaxsize: 100\n"
     );
     if route_to_api {
-        client_yaml.push_str(&format!("routes:\n  \"127.0.0.1:{srv_port}\": \"{api_base}\"\n"));
+        client_yaml.push_str(&format!(
+            "routes:\n  \"127.0.0.1:{srv_port}\": \"{api_base}\"\n"
+        ));
     }
     client_yaml.push_str(extra_client);
     let cli_cfg = format!("{dir}/client.cfg");
@@ -210,7 +219,12 @@ fn setup(route_to_api: bool, extra_client: &str) -> Env {
     } else {
         std::thread::sleep(Duration::from_secs(2));
     }
-    Env { _api, _server, _client, srv_port }
+    Env {
+        _api,
+        _server,
+        _client,
+        srv_port,
+    }
 }
 
 #[test]
@@ -229,7 +243,13 @@ fn test_full_proxy_flow() {
     assert_eq!(resp.headers().get("hello").unwrap(), "world");
 
     // POST /post -> echo body
-    let resp = proxy_request(p, reqwest::Method::POST, "/post", Some(b"ping=pong".to_vec()), &[]);
+    let resp = proxy_request(
+        p,
+        reqwest::Method::POST,
+        "/post",
+        Some(b"ping=pong".to_vec()),
+        &[],
+    );
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.text().unwrap(), "ping=pong");
 
@@ -260,9 +280,10 @@ fn test_no_proxy_available() {
     let dir = tmpdir();
     let srv_port = free_port();
     let srv_cfg = format!("{dir}/server.cfg");
-    write_cfg(&srv_cfg, &format!(
-        "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n"
-    ));
+    write_cfg(
+        &srv_cfg,
+        &format!("---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n"),
+    );
     let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
     wait_for_server(srv_port);
 
@@ -283,7 +304,10 @@ fn test_no_route() {
 #[test]
 fn test_client_side_blacklist() {
     // Client denies any path matching .*forbidden.* (applied to the arrival URL).
-    let env = setup(true, "blacklist:\n - method: \".*\"\n   url: \".*forbidden.*\"\n");
+    let env = setup(
+        true,
+        "blacklist:\n - method: \".*\"\n   url: \".*forbidden.*\"\n",
+    );
     let p = env.srv_port;
 
     // Allowed path -> 200
@@ -302,7 +326,11 @@ fn test_wrong_secret_key() {
     let api_port = free_port();
     let srv_port = free_port();
     let api_base = format!("http://127.0.0.1:{api_port}");
-    let _api = Proc::spawn("test_api", &bin("how-test-api"), &["-addr", &format!("127.0.0.1:{api_port}")]);
+    let _api = Proc::spawn(
+        "test_api",
+        &bin("how-test-api"),
+        &["-addr", &format!("127.0.0.1:{api_port}")],
+    );
 
     let srv_cfg = format!("{dir}/server.cfg");
     write_cfg(&srv_cfg, &format!(
@@ -312,10 +340,13 @@ fn test_wrong_secret_key() {
     wait_for_server(srv_port);
 
     let cli_cfg = format!("{dir}/client.cfg");
-    write_cfg(&cli_cfg, &format!(
+    write_cfg(
+        &cli_cfg,
+        &format!(
         "---\ntargets:\n - ws://127.0.0.1:{srv_port}/register\npoolidlesize: 2\npoolmaxsize: 100\n\
          secretkey: WRONG\nroutes:\n  \"127.0.0.1:{srv_port}\": \"{api_base}\"\n"
-    ));
+    ),
+    );
     let _client = Proc::spawn("client", &bin("how-client"), &["--config", &cli_cfg]);
 
     std::thread::sleep(Duration::from_secs(3));
@@ -352,10 +383,13 @@ fn test_server_allowed_hosts() {
 
     // Client routes the arrival host "localhost:<port>" -> test_api.
     let cli_cfg = format!("{dir}/client.cfg");
-    write_cfg(&cli_cfg, &format!(
+    write_cfg(
+        &cli_cfg,
+        &format!(
         "---\ntargets:\n - ws://127.0.0.1:{srv_port}/register\npoolidlesize: 2\npoolmaxsize: 100\n\
          routes:\n  \"localhost:{srv_port}\": \"{api_base}\"\n"
-    ));
+    ),
+    );
     let _client = Proc::spawn("client", &bin("how-client"), &["--config", &cli_cfg]);
 
     // Wait until the localhost path is proxied (client registered + route ok).
@@ -374,16 +408,22 @@ fn test_server_allowed_hosts() {
     }
 
     // Bound domain (localhost) -> proxied -> 200.
-    let resp = http().get(&format!("http://localhost:{srv_port}/hello")).send().unwrap();
+    let resp = http()
+        .get(format!("http://localhost:{srv_port}/hello"))
+        .send()
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
     // IP address -> 403 (cannot bypass the bound domain via IP).
-    let resp = http().get(&format!("http://127.0.0.1:{srv_port}/hello")).send().unwrap();
+    let resp = http()
+        .get(format!("http://127.0.0.1:{srv_port}/hello"))
+        .send()
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
 
     // Unlisted domain (Host override) -> 403.
     let resp = http()
-        .get(&format!("http://127.0.0.1:{srv_port}/hello"))
+        .get(format!("http://127.0.0.1:{srv_port}/hello"))
         .header("host", format!("evil.com:{srv_port}"))
         .send()
         .unwrap();
@@ -403,13 +443,22 @@ fn test_server_ip_whitelist() {
     let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
     wait_for_server(srv_port);
 
-    let resp = http().get(&format!("http://127.0.0.1:{srv_port}/hello")).send().unwrap();
+    let resp = http()
+        .get(format!("http://127.0.0.1:{srv_port}/hello"))
+        .send()
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
     let body = resp.text().unwrap();
-    assert!(body.contains("DENY 127.0.0.1"), "expected DENY, got: {body}");
+    assert!(
+        body.contains("DENY 127.0.0.1"),
+        "expected DENY, got: {body}"
+    );
 
     // /status is NOT gated (health check still works).
-    let resp = http().get(&format!("http://127.0.0.1:{srv_port}/status")).send().unwrap();
+    let resp = http()
+        .get(format!("http://127.0.0.1:{srv_port}/status"))
+        .send()
+        .unwrap();
     assert!(resp.status().is_success());
 }
 
@@ -420,25 +469,35 @@ fn test_server_apikey_validation() {
     let api_port = free_port();
     let srv_port = free_port();
     let api_base = format!("http://127.0.0.1:{api_port}");
-    let _api = Proc::spawn("test_api", &bin("how-test-api"), &["-addr", &format!("127.0.0.1:{api_port}")]);
+    let _api = Proc::spawn(
+        "test_api",
+        &bin("how-test-api"),
+        &["-addr", &format!("127.0.0.1:{api_port}")],
+    );
     let srv_cfg = format!("{dir}/server.cfg");
-    write_cfg(&srv_cfg, &format!(
-        "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n\
+    write_cfg(
+        &srv_cfg,
+        &format!(
+            "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n\
          apikeys:\n - sk-valid-key-123\n"
-    ));
+        ),
+    );
     let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
     wait_for_server(srv_port);
     let cli_cfg = format!("{dir}/client.cfg");
-    write_cfg(&cli_cfg, &format!(
+    write_cfg(
+        &cli_cfg,
+        &format!(
         "---\ntargets:\n - ws://127.0.0.1:{srv_port}/register\npoolidlesize: 2\npoolmaxsize: 100\n\
          routes:\n  \"127.0.0.1:{srv_port}\": \"{api_base}\"\n"
-    ));
+    ),
+    );
     let _client = Proc::spawn("client", &bin("how-client"), &["--config", &cli_cfg]);
     // Wait for the client to register (poll with a valid API key).
     let start = Instant::now();
     loop {
         let resp = http()
-            .get(&format!("http://127.0.0.1:{srv_port}/hello"))
+            .get(format!("http://127.0.0.1:{srv_port}/hello"))
             .header("Authorization", "Bearer sk-valid-key-123")
             .send();
         if let Ok(r) = resp {
@@ -460,16 +519,28 @@ fn test_server_apikey_validation() {
     assert!(resp.text().unwrap().contains("Missing"));
 
     // Wrong key -> 403.
-    let resp = http().get(&url).header("Authorization", "Bearer sk-wrong").send().unwrap();
+    let resp = http()
+        .get(&url)
+        .header("Authorization", "Bearer sk-wrong")
+        .send()
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
     assert!(resp.text().unwrap().contains("Invalid API key"));
 
     // Valid key -> 200.
-    let resp = http().get(&url).header("Authorization", "Bearer sk-valid-key-123").send().unwrap();
+    let resp = http()
+        .get(&url)
+        .header("Authorization", "Bearer sk-valid-key-123")
+        .send()
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
     // Authentication schemes are case-insensitive.
-    let resp = http().get(&url).header("Authorization", "bearer sk-valid-key-123").send().unwrap();
+    let resp = http()
+        .get(&url)
+        .header("Authorization", "bearer sk-valid-key-123")
+        .send()
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 }
 
@@ -479,18 +550,26 @@ fn test_pool_saturation_timeout() {
     let api_port = free_port();
     let srv_port = free_port();
     let api_base = format!("http://127.0.0.1:{api_port}");
-    let _api = Proc::spawn("test_api", &bin("how-test-api"), &["-addr", &format!("127.0.0.1:{api_port}")]);
+    let _api = Proc::spawn(
+        "test_api",
+        &bin("how-test-api"),
+        &["-addr", &format!("127.0.0.1:{api_port}")],
+    );
     let srv_cfg = format!("{dir}/server.cfg");
-    write_cfg(&srv_cfg, &format!(
-        "---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n"
-    ));
+    write_cfg(
+        &srv_cfg,
+        &format!("---\nhost: 127.0.0.1\nport: {srv_port}\ntimeout: 1000\nidletimeout: 60000\n"),
+    );
     let _server = Proc::spawn("server", &bin("how-server"), &["--config", &srv_cfg]);
     wait_for_server(srv_port);
     let cli_cfg = format!("{dir}/client.cfg");
-    write_cfg(&cli_cfg, &format!(
+    write_cfg(
+        &cli_cfg,
+        &format!(
         "---\ntargets:\n - ws://127.0.0.1:{srv_port}/register\npoolidlesize: 3\npoolmaxsize: 3\n\
          routes:\n  \"127.0.0.1:{srv_port}\": \"{api_base}\"\n"
-    ));
+    ),
+    );
     let _client = Proc::spawn("client", &bin("how-client"), &["--config", &cli_cfg]);
     wait_for_proxy(srv_port);
 
@@ -532,7 +611,10 @@ fn test_streaming_response() {
             .expect("no-proxy client");
         let resp = client.get(&url).send().await.expect("stream req");
         assert_eq!(resp.status().as_u16(), 200);
-        assert_eq!(resp.headers().get("content-type").unwrap(), "text/event-stream");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
         assert!(resp.headers().get("content-length").is_none());
         let mut first: Option<Duration> = None;
         let mut all = String::new();
@@ -547,8 +629,14 @@ fn test_streaming_response() {
         }
         let total = t0.elapsed();
         let fb = first.expect("no bytes");
-        assert!(fb.as_millis() < 1000, "streaming not preserved: first byte at {fb:?}");
-        assert!(total.as_millis() > 1500, "response too fast (buffered?): {total:?}");
+        assert!(
+            fb.as_millis() < 1000,
+            "streaming not preserved: first byte at {fb:?}"
+        );
+        assert!(
+            total.as_millis() > 1500,
+            "response too fast (buffered?): {total:?}"
+        );
         for i in 0..5 {
             assert!(all.contains(&format!("tok-{i}")), "missing tok-{i}");
         }
@@ -561,7 +649,13 @@ fn test_large_streamed_upload() {
     let env = setup(true, "");
     let size = 1024 * 1024;
     let blob: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    let resp = proxy_request(env.srv_port, reqwest::Method::POST, "/post", Some(blob.clone()), &[]);
+    let resp = proxy_request(
+        env.srv_port,
+        reqwest::Method::POST,
+        "/post",
+        Some(blob.clone()),
+        &[],
+    );
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.bytes().unwrap().as_ref(), blob.as_slice());
 }
