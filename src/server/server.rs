@@ -414,17 +414,15 @@ async fn handle_request(
         _ => return proxy_error_response("Unable to get a proxy connection"),
     };
 
-    // 从发送请求头到接收响应头的全链路超时（`upstreamtimeout` 配置，默认
-    // 30s；只覆盖到响应头为止，响应 body 之后流式回传、不受它限制）。
+    // 从发送请求头到接收响应头的全链路超时（`upstreamtimeout` 配置；
+    // 0/未配置 = 不限时。只覆盖到响应头为止，响应 body 之后流式回传、
+    // 不受它限制）。
     //
-    // 之前仅有"获取连接"的 1s timeout，获取连接后到收到响应头之间完全
-    // 没有超时——一旦 how-client 卡在 IPv6 回退或上游无响应，调用方会
-    // 在这里无限等待，表现为几十秒甚至更久的 hang。
-    //
-    // 默认值与 client 端的 upstreamtimeout 对齐：客户端内部已经会在期限
-    // 内主动返回超时错误，这里再做一次服务端兜底，即使 WebSocket 链路
-    // 异常导致客户端错误传不回来，server 也能自行解挂。
-    let upstream_roundtrip_deadline = Duration::from_millis(inner.config.upstream_timeout as u64);
+    // 未配置时沿用原始行为（无限等待）；配置后客户端卡在慢上游时，
+    // 调用方最长只等这个期限，即使 WebSocket 链路异常导致客户端错误
+    // 传不回来，server 也能自行解挂。
+    let upstream_roundtrip_deadline = (inner.config.upstream_timeout > 0)
+        .then(|| Duration::from_millis(inner.config.upstream_timeout as u64));
     let req_url = http_req.url.clone();
     let method = http_req.method.clone();
     let roundtrip_start = Instant::now();
@@ -462,8 +460,28 @@ async fn handle_request(
         Ok::<HttpResponse, (String, String)>(resp)
     };
 
-    let http_resp = match tokio::time::timeout(upstream_roundtrip_deadline, upstream_future).await {
-        Ok(Ok(h)) => {
+    // (HttpResponse, Err((log_msg, user_msg)))，未配置 upstreamtimeout 时
+    // 没有超时分支。
+    let roundtrip = match upstream_roundtrip_deadline {
+        Some(d) => match tokio::time::timeout(d, upstream_future).await {
+            Ok(r) => r,
+            Err(_) => {
+                let waited_ms = roundtrip_start.elapsed().as_millis();
+                log::log(format!(
+                    "代理往返超时（upstreamtimeout={}ms）：[{}] {} 已等待={waited_ms}ms",
+                    inner.config.upstream_timeout, method, req_url,
+                ));
+                conn.close();
+                return proxy_error_response(&format!(
+                    "Proxy request timed out waiting for upstream ({}ms)",
+                    inner.config.upstream_timeout
+                ));
+            }
+        },
+        None => upstream_future.await,
+    };
+    let http_resp = match roundtrip {
+        Ok(h) => {
             log::log(format!(
                 "代理往返成功：[{}] {} 状态码={} 耗时={}ms",
                 method,
@@ -473,7 +491,7 @@ async fn handle_request(
             ));
             h
         }
-        Ok(Err((log_msg, user_msg))) => {
+        Err((log_msg, user_msg)) => {
             log::log(format!(
                 "代理往返失败：[{}] {} 原因={} 耗时={}ms",
                 method,
@@ -483,18 +501,6 @@ async fn handle_request(
             ));
             conn.close();
             return proxy_error_response(&user_msg);
-        }
-        Err(_elapsed) => {
-            let waited_ms = roundtrip_start.elapsed().as_millis();
-            log::log(format!(
-                "代理往返超时（upstreamtimeout={}ms）：[{}] {} 已等待={waited_ms}ms",
-                inner.config.upstream_timeout, method, req_url,
-            ));
-            conn.close();
-            return proxy_error_response(&format!(
-                "Proxy request timed out waiting for upstream ({}ms)",
-                inner.config.upstream_timeout
-            ));
         }
     };
 

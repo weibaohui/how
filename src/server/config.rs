@@ -1,6 +1,5 @@
 //! Server configuration.
 
-use crate::log;
 use std::path::Path;
 
 /// Configures a Server. The server is a transparent catch-all reverse proxy:
@@ -28,8 +27,8 @@ pub struct Config {
     /// client tunnel until that client returns the upstream's response
     /// headers. Bounds what the HTTP caller waits when a client is stuck on
     /// a slow/hung upstream; the response BODY streams unbounded after the
-    /// headers arrive. Default 30000. `0`/negative falls back to the default.
-    #[serde(rename = "upstreamtimeout", default = "default_upstream_timeout")]
+    /// headers arrive. **0/unset = no limit** (explicit-only).
+    #[serde(rename = "upstreamtimeout", default)]
     pub upstream_timeout: i64,
     #[serde(rename = "secretkey", default)]
     pub secret_key: String,
@@ -66,9 +65,6 @@ fn default_idle_timeout() -> i64 {
 fn default_liveness_timeout() -> i64 {
     120000
 }
-fn default_upstream_timeout() -> i64 {
-    30000
-}
 
 /// Create a new Server config with default values.
 pub fn new_config() -> Config {
@@ -78,7 +74,8 @@ pub fn new_config() -> Config {
         timeout: default_timeout(),
         idle_timeout: default_idle_timeout(),
         liveness_timeout: default_liveness_timeout(),
-        upstream_timeout: default_upstream_timeout(),
+        // Explicit-only: 0 (= unset) means "no limit".
+        upstream_timeout: 0,
         secret_key: String::new(),
         allowed_hosts: Vec::new(),
         allowips: Vec::new(),
@@ -110,25 +107,17 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.liveness_timeout <= 0 {
         config.liveness_timeout = default_liveness_timeout();
     }
-    // Same "non-positive = unset" rule: a negative would panic on the
-    // Duration conversion, a zero would disable the roundtrip guard.
-    if config.upstream_timeout <= 0 {
-        log::log(format!(
-            "upstreamtimeout {}ms is not positive; falling back to default {}ms",
-            config.upstream_timeout,
-            default_upstream_timeout()
-        ));
-        config.upstream_timeout = default_upstream_timeout();
-    }
+    // upstreamtimeout is explicit-only: absent or <= 0 stays "no limit" —
+    // nothing is applied that was not configured.
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     //! `upstreamtimeout` bounds what an HTTP caller waits for a WSP client's
-    //! upstream response headers. These tests pin the load-time fallback:
-    //! non-positive / unset values degrade to the safe default while a sane
-    //! value is preserved.
+    //! upstream response headers. Explicit-only semantics: absent / 0 /
+    //! negative all mean "no limit" (stay <= 0) — no silent default — while
+    //! a positive value is preserved as-is.
 
     use super::*;
 
@@ -146,13 +135,10 @@ mod tests {
     }
 
     #[test]
-    fn upstream_timeout_non_positive_falls_back_to_default() {
-        let c = load_with("upstreamtimeout: 0");
-        assert_eq!(c.upstream_timeout, default_upstream_timeout());
-        let c = load_with("upstreamtimeout: -1");
-        assert_eq!(c.upstream_timeout, default_upstream_timeout());
-        let c = load_with("");
-        assert_eq!(c.upstream_timeout, default_upstream_timeout());
+    fn upstream_timeout_unset_or_non_positive_means_no_limit() {
+        assert!(load_with("").upstream_timeout <= 0);
+        assert!(load_with("upstreamtimeout: 0").upstream_timeout <= 0);
+        assert!(load_with("upstreamtimeout: -1").upstream_timeout <= 0);
     }
 
     #[test]

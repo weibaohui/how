@@ -46,16 +46,36 @@ pub struct Config {
     /// Upstream connect timeout (ms): bounds DNS + TCP + TLS for dialing a
     /// route's upstream. Caps the damage of a blackholed address (dropped
     /// SYNs would otherwise stall the request for the OS retransmit ladder).
-    /// Default 5000. `0`/negative falls back to the default.
-    #[serde(rename = "connecttimeout", default = "default_connect_timeout")]
+    /// **0/unset = no limit** (explicit-only: nothing is applied that was
+    /// not configured).
+    #[serde(rename = "connecttimeout", default)]
     pub connect_timeout: i64,
     /// Upstream call deadline (ms): from sending the request to the upstream
     /// until its response HEADERS arrive (the body then streams unbounded —
-    /// a slow but flowing SSE stream is never cut; a stalled one is caught
-    /// by the stream idle timeout instead). Bounds the time-to-first-byte a
-    /// caller waits. Default 30000. `0`/negative falls back to the default.
-    #[serde(rename = "upstreamtimeout", default = "default_upstream_timeout")]
+    /// a slow but flowing SSE stream is never cut). Bounds the
+    /// time-to-first-byte a caller waits. **0/unset = no limit.**
+    #[serde(rename = "upstreamtimeout", default)]
     pub upstream_timeout: i64,
+    /// Tunnel establishment deadline (ms): bounds each phase of dialing the
+    /// WSP server (TCP connect, WebSocket handshake, greeting send). A
+    /// blackholed server address would otherwise hang a `Connecting` pool
+    /// entry forever, silently consuming pool capacity.
+    /// **0/unset = no limit.**
+    #[serde(rename = "tunneltimeout", default)]
+    pub tunnel_timeout: i64,
+    /// Upstream stream idle timeout (ms): per-read stall detection while
+    /// receiving an upstream response — a connection that stops sending for
+    /// this long is considered dead. A flowing stream is never cut, however
+    /// long it runs. **0/unset = no limit** (a truly hung upstream then
+    /// holds the request open indefinitely).
+    #[serde(rename = "streamidletimeout", default)]
+    pub stream_idle_timeout: i64,
+    /// Upstream connection pool idle timeout (ms): pooled keep-alive
+    /// connections to a route's upstream that stay unused for this long are
+    /// closed (a middlebox may have silently cut them in the meantime).
+    /// **0/unset = pooled connections are kept forever.**
+    #[serde(rename = "upstreamidletimeout", default)]
+    pub upstream_idle_timeout: i64,
     #[serde(default)]
     pub whitelist: Vec<Rule>,
     #[serde(default)]
@@ -103,12 +123,6 @@ fn default_pool_max_size() -> i64 {
 fn default_liveness_timeout() -> i64 {
     90000
 }
-fn default_connect_timeout() -> i64 {
-    5000
-}
-fn default_upstream_timeout() -> i64 {
-    30000
-}
 
 /// Create a new client config with default values (including a fresh UUID).
 pub fn new_config() -> Config {
@@ -118,8 +132,13 @@ pub fn new_config() -> Config {
         pool_idle_size: default_pool_idle_size(),
         pool_max_size: default_pool_max_size(),
         liveness_timeout: default_liveness_timeout(),
-        connect_timeout: default_connect_timeout(),
-        upstream_timeout: default_upstream_timeout(),
+        // Timeouts are explicit-only: 0 (= unset) means "no limit". Nothing
+        // is applied that the operator did not configure.
+        connect_timeout: 0,
+        upstream_timeout: 0,
+        tunnel_timeout: 0,
+        stream_idle_timeout: 0,
+        upstream_idle_timeout: 0,
         whitelist: Vec::new(),
         blacklist: Vec::new(),
         secret_key: String::new(),
@@ -167,25 +186,11 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
         ));
         config.liveness_timeout = default_liveness_timeout();
     }
-    // Same "non-positive = unset" rule as livenesstimeout: a negative would
-    // panic on the Duration conversion and a zero would disable a guard that
-    // exists to bound stuck upstreams.
-    if config.connect_timeout <= 0 {
-        log::log(format!(
-            "connecttimeout {}ms is not positive; falling back to default {}ms",
-            config.connect_timeout,
-            default_connect_timeout()
-        ));
-        config.connect_timeout = default_connect_timeout();
-    }
-    if config.upstream_timeout <= 0 {
-        log::log(format!(
-            "upstreamtimeout {}ms is not positive; falling back to default {}ms",
-            config.upstream_timeout,
-            default_upstream_timeout()
-        ));
-        config.upstream_timeout = default_upstream_timeout();
-    }
+    // Timeouts (connecttimeout / upstreamtimeout / tunneltimeout /
+    // streamidletimeout / upstreamidletimeout) are explicit-only: absent or
+    // 0 means "no limit", a positive value is used as-is. No silent
+    // defaults. (livenesstimeout above keeps its floor: a value below ~2x
+    // the ping interval would false-reap healthy tunnels.)
     for rule in config.whitelist.iter_mut() {
         rule.compile().map_err(|e| e.to_string())?;
     }
@@ -255,31 +260,46 @@ mod tests {
     }
 
     #[test]
-    fn upstream_timeouts_non_positive_fall_back_to_default() {
-        // 0 / negative / unset connecttimeout & upstreamtimeout -> defaults.
-        for key in ["connecttimeout", "upstreamtimeout"] {
+    fn timeouts_unset_or_non_positive_mean_no_limit() {
+        // Explicit-only semantics: absent / 0 / negative all stay as "no
+        // limit" (kept as <= 0) — nothing silently becomes a default.
+        let c = load_with("");
+        assert_eq!(c.connect_timeout, 0);
+        assert_eq!(c.upstream_timeout, 0);
+        assert_eq!(c.tunnel_timeout, 0);
+        assert_eq!(c.stream_idle_timeout, 0);
+        assert_eq!(c.upstream_idle_timeout, 0);
+        for key in [
+            "connecttimeout",
+            "upstreamtimeout",
+            "tunneltimeout",
+            "streamidletimeout",
+            "upstreamidletimeout",
+        ] {
             let c = load_with(&format!("{key}: 0"));
             let c2 = load_with(&format!("{key}: -5"));
-            match key {
-                "connecttimeout" => {
-                    assert_eq!(c.connect_timeout, default_connect_timeout());
-                    assert_eq!(c2.connect_timeout, default_connect_timeout());
-                }
-                _ => {
-                    assert_eq!(c.upstream_timeout, default_upstream_timeout());
-                    assert_eq!(c2.upstream_timeout, default_upstream_timeout());
-                }
-            }
+            let (v, v2) = match key {
+                "connecttimeout" => (c.connect_timeout, c2.connect_timeout),
+                "upstreamtimeout" => (c.upstream_timeout, c2.upstream_timeout),
+                "tunneltimeout" => (c.tunnel_timeout, c2.tunnel_timeout),
+                "streamidletimeout" => (c.stream_idle_timeout, c2.stream_idle_timeout),
+                _ => (c.upstream_idle_timeout, c2.upstream_idle_timeout),
+            };
+            assert!(v <= 0, "{key}: 0 must stay no-limit");
+            assert!(v2 <= 0, "{key}: negative must stay no-limit");
         }
-        let c = load_with("");
-        assert_eq!(c.connect_timeout, default_connect_timeout());
-        assert_eq!(c.upstream_timeout, default_upstream_timeout());
     }
 
     #[test]
-    fn upstream_timeouts_positive_values_are_preserved() {
-        let c = load_with("connecttimeout: 2000\nupstreamtimeout: 45000");
+    fn timeouts_positive_values_are_preserved_as_is() {
+        let c = load_with(
+            "connecttimeout: 2000\nupstreamtimeout: 45000\ntunneltimeout: 8000\n\
+             streamidletimeout: 60000\nupstreamidletimeout: 30000",
+        );
         assert_eq!(c.connect_timeout, 2000);
         assert_eq!(c.upstream_timeout, 45_000);
+        assert_eq!(c.tunnel_timeout, 8000);
+        assert_eq!(c.stream_idle_timeout, 60_000);
+        assert_eq!(c.upstream_idle_timeout, 30_000);
     }
 }
