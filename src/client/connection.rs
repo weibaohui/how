@@ -545,23 +545,33 @@ async fn serve(
             }
         }
 
-        // Stream the request body to the upstream: read binary chunks off the
-        // websocket and feed them into a reqwest streaming body, concurrently
-        // with send() (which pulls the stream). `body_tx` is owned by the
-        // producer so it is dropped when the body ends, signalling end-of-body
-        // to reqwest; `read_rx` is borrowed so the serve loop keeps it.
+        // 将请求体流式写入 reqwest：从 WebSocket 上逐个读取二进制帧送入
+        // body channel，reqwest 通过 stream 消费它。body_tx 由 producer 拥有，
+        // producer 结束（读到空 end-marker）时 body_tx 被 drop，reqwest 就知
+        // 道请求体结束了；read_rx 是借用所以 serve 循环继续持有它。
+        //
+        // 额外加一层 30s 的上游调用超时：
+        // 虽然 Client::new 里已经给 reqwest 设置了 timeout，但那是从发出
+        // 请求到 body 读完的"总"超时。这里在 send 这一层再包一次显式超时
+        // 并打印耗时日志，目的是：
+        //   1) 下次再遇到慢请求时，日志里能立刻看到是"上游建立连接慢"
+        //      还是"上游返回数据慢"（和 Client 总超时配合双重兜底）；
+        //   2) 遇到配置错误等特殊情况导致 reqwest 内部 timeout 失效时，
+        //      仍能保证不会无限挂住一条 Running 连接（Running 连接会阻止
+        //      keepalive 的半开回收逻辑，长时间挂死会把池子拖没）。
+        let upstream_call_deadline = Duration::from_secs(30);
         let (body_tx, body_rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
         let req_body =
             reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx));
         let reqwest_req = http_client
-            .request(method, url)
+            .request(method, url.clone())
             .headers(headers)
             .body(req_body);
         let read_rx_ref = &mut read_rx;
         let producer = async move {
             loop {
                 match read_rx_ref.recv().await {
-                    Some(Message::Binary(b)) if b.is_empty() => break, // end-marker
+                    Some(Message::Binary(b)) if b.is_empty() => break, // 结束标记
                     Some(Message::Binary(b)) => {
                         if body_tx.send(Ok(b)).await.is_err() {
                             break;
@@ -570,13 +580,47 @@ async fn serve(
                     Some(_) | None => break,
                 }
             }
-            // body_tx dropped here -> reqwest sees end-of-body.
+            // body_tx 在这里被 drop -> reqwest 感知到请求体结束。
         };
-        let resp = match tokio::join!(producer, reqwest_req.send()).1 {
-            Ok(r) => r,
-            Err(e) => {
-                let _ =
-                    send_error(&write_tx, &format!("Unable to execute request : {}\n", e)).await;
+        let call_start = Instant::now();
+        let send_future = async { tokio::join!(producer, reqwest_req.send()).1 };
+        let resp = match tokio::time::timeout(upstream_call_deadline, send_future).await {
+            Ok(Ok(r)) => {
+                // 上游响应头已收到，这里只记录"到拿到响应头"的耗时；
+                // body 是流式的，后续再慢慢写回，不计入这段日志。
+                log::log(format!(
+                    "上游调用成功：{} 状态码={} 已耗时={}ms",
+                    url,
+                    r.status(),
+                    call_start.elapsed().as_millis()
+                ));
+                r
+            }
+            Ok(Err(e)) => {
+                log::log(format!(
+                    "上游调用失败：{} 错误={} 已耗时={}ms",
+                    url,
+                    e,
+                    call_start.elapsed().as_millis()
+                ));
+                let _ = send_error(
+                    &write_tx,
+                    &format!("Unable to execute request : {}\n", e),
+                )
+                .await;
+                continue;
+            }
+            Err(_elapsed) => {
+                log::log(format!(
+                    "上游调用超时（30s）：{} 已等待={}ms",
+                    url,
+                    call_start.elapsed().as_millis()
+                ));
+                let _ = send_error(
+                    &write_tx,
+                    "Unable to execute request : upstream timeout after 30s\n",
+                )
+                .await;
                 continue;
             }
         };
