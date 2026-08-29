@@ -3,6 +3,12 @@
 use regex::Regex;
 use std::collections::HashMap;
 
+/// The handshake response header carrying the server-assigned tunnel number
+/// to the client (`/register`'s 101 sets it; the client adopts the number so
+/// both ends log the same `tunnel#N` for the same connection). Shared here so
+/// the two ends cannot drift on the name.
+pub const TUNNEL_ID_HEADER: &str = "X-TUNNEL-ID";
+
 /// A serializable version of `http::Request` (only the useful fields).
 ///
 /// JSON field names mirror the original Go struct so that a Rust server is

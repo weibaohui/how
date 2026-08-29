@@ -6,7 +6,7 @@
 //! streams the `HttpResponse` and body back.
 
 use crate::client::pool::Pool;
-use crate::common::{client_error_status, HttpRequest, HttpResponse};
+use crate::common::{client_error_status, HttpRequest, HttpResponse, TUNNEL_ID_HEADER};
 use crate::log;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -194,7 +194,7 @@ impl Connection {
         // here on both ends log the same `tunnel#N` for this connection.
         if let Some(id) = resp
             .headers()
-            .get("X-TUNNEL-ID")
+            .get(TUNNEL_ID_HEADER)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -528,10 +528,8 @@ async fn serve(
             }
         };
 
-        // Count and log the request WITH the tunnel id: "which request went
-        // through which websocket" is then a single `grep tunnel#N`.
-        conn.served
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Log the request WITH the tunnel id: "which request went through
+        // which websocket" is then a single `grep tunnel#N`.
         log::log(format!(
             "[tunnel#{} {}] {}",
             conn.id(),
@@ -606,6 +604,11 @@ async fn serve(
                 continue;
             }
         };
+        // Past the last rejection path — this request is actually being
+        // forwarded. Count it as served (denied/unroutable requests are
+        // logged above but do not count).
+        conn.served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, values) in &http_req.header {
             let hname = match reqwest::header::HeaderName::from_bytes(name.as_bytes()) {

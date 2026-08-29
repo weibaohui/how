@@ -5,7 +5,7 @@
 //! client websocket, executed locally by the client, and the response is
 //! streamed back.
 
-use crate::common::{proxy_error_status, HttpRequest, HttpResponse};
+use crate::common::{proxy_error_status, HttpRequest, HttpResponse, TUNNEL_ID_HEADER};
 use crate::log;
 use crate::server::config::Config;
 use crate::server::connection::{msg_text, Connection};
@@ -568,7 +568,7 @@ async fn handle_register(inner: Arc<Inner>, req: Request<Incoming>) -> Response<
         .header("upgrade", "websocket")
         .header("connection", "Upgrade")
         .header("sec-websocket-accept", accept)
-        .header("X-TUNNEL-ID", conn_id.to_string())
+        .header(TUNNEL_ID_HEADER, conn_id.to_string())
         .body(Full::new(Bytes::new()).boxed())
         .unwrap();
 

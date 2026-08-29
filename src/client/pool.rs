@@ -26,10 +26,11 @@ pub struct Pool {
     /// backing off. Set by `note_outcome(false)`, cleared by `note_outcome(true)`.
     backoff_until: Mutex<Option<Instant>>,
     /// Last pool-composition snapshot that was logged. The stats line prints
-    /// only when the composition CHANGES (tunnel connected / closed / a
-    /// request flipped Idle<->Running), so steady state adds no log noise
-    /// while "how many websockets does the pool have" stays one grep away.
-    last_stats: Mutex<Option<(usize, usize, usize)>>,
+    /// only when the composition CHANGES — keyed on (connecting, idle) only:
+    /// tunnel created / connected / closed. `running` is shown in the line
+    /// but deliberately NOT part of the key, so a request passing through
+    /// (Idle -> Running -> Idle) does not emit two extra lines each time.
+    last_stats: Mutex<Option<(usize, usize)>>,
 }
 
 /// Number of open connections per status.
@@ -131,18 +132,23 @@ impl Pool {
     }
 
     /// Log "pool: N tunnels (connecting=X, idle=Y, running=Z)" whenever the
-    /// composition changes since the previous line. Checked on the 1s tick,
-    /// so a transition is reflected at most one second after it happens.
+    /// composition changes since the previous line (keyed on connecting/idle
+    /// only — see `last_stats`). Checked on the 1s tick, so a transition is
+    /// reflected at most one second after it happens.
     fn log_stats_if_changed(&self) {
-        let snapshot = {
+        let (key, connecting, idle, running) = {
             let conns = self.connections.lock().unwrap();
             let size = self.size_locked(&conns);
-            (size.connecting, size.idle, size.running)
+            (
+                (size.connecting, size.idle),
+                size.connecting,
+                size.idle,
+                size.running,
+            )
         };
         let mut last = self.last_stats.lock().unwrap();
-        if *last != Some(snapshot) {
-            *last = Some(snapshot);
-            let (connecting, idle, running) = snapshot;
+        if *last != Some(key) {
+            *last = Some(key);
             let total = connecting + idle + running;
             log::log(format!(
                 "pool: {total} tunnel{} (connecting={connecting}, idle={idle}, running={running})",
