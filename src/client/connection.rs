@@ -18,15 +18,10 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
 
-/// Keepalive cadence: how often the keepalive task wakes to run the liveness
-/// check (and maybe send a ping).
-pub(crate) const CHECK_INTERVAL_MS: i64 = 10_000;
-
 /// Keepalive ping interval: periodic outbound pings keep NAT/firewall idle
-/// timers from dropping a quiet link, and the pongs they elicit are what the
-/// liveness check measures. The config-side floor
-/// (`MIN_LIVENESS_TIMEOUT_MS` in `config.rs`) is derived from this, so the
-/// two must change together.
+/// timers from dropping a quiet link. The pings are pure keepalive — a
+/// RUNNING tunnel silently waiting for upstream first bytes relies on them
+/// (the health-round probes only cover idle tunnels).
 pub(crate) const PING_INTERVAL_MS: i64 = 30_000;
 
 /// How long an active liveness probe (`Connection::probe`) waits for a pong
@@ -166,6 +161,14 @@ impl Connection {
         *self.last_activity.lock().unwrap()
     }
 
+    /// Test support: overwrite the last-frame timestamp (the driver refreshes
+    /// it in production; tests backdate it to simulate a silent link for the
+    /// probe's wedge backstop).
+    #[cfg(test)]
+    pub(crate) fn set_last_activity(&self, t: Instant) {
+        *self.last_activity.lock().unwrap() = t;
+    }
+
     /// When the tunnel became usable, if ever (used by `shutdown` to score the
     /// connection's lifecycle for the connector backoff).
     fn connected_at(&self) -> Option<Instant> {
@@ -294,7 +297,6 @@ impl Connection {
 
         let cancel = self.cancel.clone();
         let driver_cancel = cancel.child_token();
-        let liveness_timeout = Duration::from_millis(config.liveness_timeout as u64);
 
         // Driver: owns the stream, multiplexes reads/writes.
         let driver_conn = this.clone();
@@ -312,19 +314,14 @@ impl Connection {
             config,
         ));
 
-        // Keepalive: send a ping every 30s (keeps NAT/firewall idle timers
-        // from dropping the tunnel) and reap the connection when no frame at
-        // all has been received for `liveness_timeout` (a half-open link the
-        // pings cannot revive). Only the client can re-establish the tunnel
-        // (the server cannot dial back into the private network), so this
-        // self-heal is what keeps the pool warm overnight.
-        let keepalive_conn = this.clone();
+        // Keepalive (ping duty only): a ping every 30s keeps NAT/firewall
+        // idle timers from dropping a quiet link — including a Running tunnel
+        // silently waiting for upstream first bytes. Dead-link DETECTION is
+        // the pool's health-round probes (`Connection::probe`), not this
+        // loop.
         tokio::spawn(keepalive_loop(
-            keepalive_conn,
             write_tx,
             cancel,
-            liveness_timeout,
-            Duration::from_millis(CHECK_INTERVAL_MS as u64),
             Duration::from_millis(PING_INTERVAL_MS as u64),
         ));
 
@@ -384,20 +381,25 @@ impl Connection {
     }
 
     /// Actively verify this tunnel is usable RIGHT NOW: send a ping and wait
-    /// for a pong within `deadline`. Unlike the passive keepalive reaper
-    /// (which waits `liveness_timeout` for ANY frame and so needs minutes to
-    /// notice a dead link), a probe settles in ~RTT and turns "Idle by
-    /// status" into "verified available" — the basis of the pool's periodic
-    /// health round, which guarantees the server always has usable tunnels
-    /// instead of a pool of half-open ones the client still believes in.
+    /// for a pong within `deadline`. A probe settles in ~RTT and turns "Idle
+    /// by status" into "verified available" — the basis of the pool's
+    /// periodic health round, which guarantees the server always has usable
+    /// tunnels instead of a pool of half-open ones the client still believes
+    /// in. (This is the ONLY dead-link detector: the per-connection passive
+    /// reaper was removed once probes landed.)
+    ///
+    /// `stale_after` is the wedge backstop, inherited from the removed
+    /// passive reaper: a tunnel whose write queue is too full to even send
+    /// the probe ping AND that has received no frame at all for this long
+    /// cannot be healthy — a live driver drains the queue within ~RTT — so
+    /// it is declared Dead instead of eternally Skipped.
     ///
     /// Only Idle tunnels are probed. A Running tunnel is demonstrably
     /// exchanging data; a Connecting one is not up yet; a Closed one is
-    /// already gone — all Skipped. The verdict at the deadline re-checks the
-    /// status: if a request started during the probe (Idle -> Running) the
-    /// tunnel is alive and must not be killed, mirroring the TOCTOU re-check
-    /// in the keepalive reaper.
-    pub(crate) async fn probe(&self, deadline: Duration) -> ProbeOutcome {
+    /// already gone — all Skipped. The verdict re-checks the status before
+    /// killing: if a request started during the probe (Idle -> Running) the
+    /// tunnel is alive and must not be killed.
+    pub(crate) async fn probe(&self, deadline: Duration, stale_after: Duration) -> ProbeOutcome {
         if self.status() != Status::Idle {
             return ProbeOutcome::Skipped;
         }
@@ -414,10 +416,23 @@ impl Connection {
         };
         match sender.try_send(Message::Ping(bytes::Bytes::from_static(b"how-probe"))) {
             Ok(()) => {}
-            // Queue full (a streamed response just finished filling it) or
-            // the driver side already dropped: inconclusive, never kill on a
-            // maybe — the passive keepalive reaper still covers this tunnel.
-            Err(mpsc::error::TrySendError::Full(_)) => return ProbeOutcome::Skipped,
+            // Queue full. Usually that is a streamed response just finishing
+            // (frames were arriving, so `last_activity` is fresh: Skipped,
+            // retried next round). But a WEDGED driver also fills the queue
+            // and never drains it — then no frame arrives either, which is
+            // the one signature the probe cannot test directly. Fall back to
+            // the passive signal: permanently-full queue + silent link =
+            // dead. (Re-check the status so a request that started in the
+            // meantime is not killed.)
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return if self.last_activity().elapsed() > stale_after
+                    && self.status() == Status::Idle
+                {
+                    ProbeOutcome::Dead
+                } else {
+                    ProbeOutcome::Skipped
+                };
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => return ProbeOutcome::Skipped,
         }
         // Poll for the pong: a healthy link answers in ~RTT, so poll finely
@@ -517,88 +532,34 @@ async fn driver<S>(
     drop(read_tx);
 }
 
-/// Keepalive task: send a WebSocket `ping` every `ping_interval` (periodic
-/// outbound traffic keeps NAT / firewall idle timers from silently dropping a
-/// quiet link after a few hours) AND detect half-open links by reaping the
-/// connection when no frame at all (pong/data) has been received for
-/// `liveness_timeout`. Sending pings alone is not enough: a ping that never
-/// gets a pong means the peer or the path is gone, and without this check the
-/// client would hold a pool full of dead connections and never reconnect
-/// (while the server reaps its side and reports "no proxy available").
+/// Keepalive task (ping duty ONLY): send a WebSocket `ping` every
+/// `ping_interval`. Periodic outbound traffic keeps NAT / firewall idle
+/// timers from silently dropping a quiet link — including a RUNNING tunnel
+/// silently waiting for upstream first bytes, which the pool's health-round
+/// probes never cover (they only probe idle tunnels). A ping that never gets
+/// a pong used to be detected here passively (no frame for
+/// `liveness_timeout`); that detection moved to the active probes
+/// (`Connection::probe`), which verify the pong within their own deadline
+/// instead of waiting minutes for silence — the probe's `stale_after`
+/// backstop covers the wedge case this loop could uniquely see.
 ///
-/// Only **Idle** connections are reaped: a Running connection is actively
-/// proxying a request and is demonstrably alive. During a long streamed
-/// response the shared write queue can stay full (dropping pings via
-/// `try_send`), and the server only pongs in response to a ping, so
-/// `last_activity` is not refreshed mid-response — reaping then would break an
-/// in-flight request (the streaming-LLM backpressure case). This mirrors the
-/// server, which only liveness-reaps Idle (not Busy) connections.
-///
-/// `check_interval` is how often the loop wakes to run the liveness check
-/// (and maybe send a ping); `ping_interval` is the cadence of pings.
-/// Production passes 10s / 30s; tests pass tiny values for speed.
+/// The ping is best-effort (`try_send`): if the write channel is full (a
+/// streamed response is filling it), this ping is skipped — on a live link
+/// the data exchange keeps the path warm; on a dead link the probe round
+/// closes the tunnel.
 async fn keepalive_loop(
-    conn: Arc<Connection>,
     write_tx: mpsc::Sender<Message>,
     cancel: CancellationToken,
-    liveness_timeout: Duration,
-    check_interval: Duration,
     ping_interval: Duration,
 ) {
-    let mut next_ping = Instant::now();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(check_interval) => {
-                // Liveness check FIRST: if no frame from the peer for longer
-                // than the timeout, the tunnel is half-open. Close it; the
-                // pool connector (runs every 1s) dials a replacement. This is
-                // the authoritative reaper — it must not be delayed by a
-                // backed-up ping send, so the ping below is best-effort.
-                //
-                // Only reap IDLE connections: a Running connection is
-                // actively proxying a request (exchanging data right now),
-                // so it is demonstrably alive. During a long streamed
-                // response the shared write queue can stay full, dropping
-                // keepalive pings (try_send below); since the server only
-                // pongs in response to a ping it never proactively sends, no
-                // pong refreshes `last_activity`. Reaping such a connection
-                // mid-response would break an in-flight request — exactly the
-                // streaming-LLM backpressure case. Mirrors the server, which
-                // only liveness-reaps Idle (not Busy) connections.
-                let st = conn.status();
-                let idle = conn.last_activity().elapsed();
-                if st == Status::Idle && idle > liveness_timeout {
-                    // 重检 status：读取 status/last_activity 与 shutdown 之间，
-                    // serve 循环可能刚好从 read_rx 取到一个请求并把 status
-                    // 切到 Running（driver 收到该帧时已刷新了 last_activity，
-                    // 但 keepalive 用的可能是刷新前的旧值）。重检可显著缩小
-                    // 这个 TOCTOU 窗口，避免误杀正在处理的请求。窗口无法
-                    // 完全消除（除非在持锁状态下决策），但此重检已足够。
-                    if conn.status() == Status::Idle {
-                        log::log(format!(
-                            "Reaping half-open tunnel#{}: no frame from server for {}ms",
-                            conn.id(),
-                            idle.as_millis()
-                        ));
-                        conn.shutdown();
-                        break;
-                    }
-                }
-                // Send a keepalive ping at the ping interval. Non-blocking:
-                // if the write channel is full (the driver is wedged on a
-                // dead link's send buffer, or a streamed response is filling
-                // it) we just skip this ping. On a dead IDLE link the
-                // liveness check above reaps shortly; on a live RUNNING link
-                // the data exchange itself keeps the peer alive and the Idle
-                // gate prevents a false reap. This keeps the keepalive task
-                // responsive so it never stops running the liveness check.
-                if Instant::now() >= next_ping {
-                    match write_tx.try_send(Message::Ping(Vec::new().into())) {
-                        Ok(()) => next_ping = Instant::now() + ping_interval,
-                        Err(mpsc::error::TrySendError::Full(_)) => {}
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                    }
+            _ = tokio::time::sleep(ping_interval) => {
+                match write_tx.try_send(Message::Ping(Vec::new().into())) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         }
@@ -1000,131 +961,51 @@ mod tests {
         )
     }
 
-    /// A connection whose peer has gone silent (no frame received for longer
-    /// than the liveness timeout) is reaped: the keepalive task shuts it down
-    /// so the pool connector re-establishes a fresh tunnel.
+    /// The keepalive loop is PING-ONLY (dead-link detection moved to the
+    /// pool's active health-round probes): it must keep sending pings at the
+    /// configured interval.
     #[tokio::test(flavor = "current_thread")]
-    async fn keepalive_reaps_silent_tunnel() {
-        let pool = dummy_pool();
-        let conn = Connection::new(Arc::downgrade(&pool));
-        let cancel = conn.cancel.clone();
-        let (write_tx, _rx) = mpsc::channel::<Message>(8);
-        conn.set_status(Status::Idle);
-        // last_activity starts "now"; we do NOT refresh it, so real time makes
-        // it stale. liveness (30ms) > check (20ms): the first wake (20ms) sees
-        // idle=20ms < 30ms (no reap, sends a ping), the second wake (40ms)
-        // sees idle=40ms > 30ms and reaps -> exercises >1 loop iteration.
+    async fn keepalive_sends_pings_at_interval() {
+        let cancel = CancellationToken::new();
+        let (write_tx, mut rx) = mpsc::channel::<Message>(8);
         let handle = tokio::spawn(keepalive_loop(
-            conn.clone(),
+            write_tx,
+            cancel.clone(),
+            Duration::from_millis(20),
+        ));
+        for _ in 0..2 {
+            match rx.recv().await {
+                Some(m @ Message::Ping(_)) => {
+                    let _ = m; // a ping frame, at the interval
+                }
+                other => panic!("expected a ping, got {other:?}"),
+            }
+        }
+        handle.abort();
+        cancel.cancel();
+    }
+
+    /// When the write channel closes (the driver is gone) the keepalive loop
+    /// must exit on its own instead of spinning.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keepalive_stops_when_channel_closes() {
+        let cancel = CancellationToken::new();
+        let (write_tx, mut rx) = mpsc::channel::<Message>(8);
+        let handle = tokio::spawn(keepalive_loop(
             write_tx,
             cancel,
-            Duration::from_millis(30),
-            Duration::from_millis(20),
-            Duration::from_millis(50),
+            Duration::from_millis(15),
         ));
-
+        rx.recv().await.expect("first ping");
+        drop(rx); // driver side gone -> sender errors -> loop must finish
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if conn.status() == Status::Closed {
-                break;
-            }
-            if Instant::now() > deadline {
-                panic!("a silent (half-open) tunnel must be reaped by the keepalive task");
-            }
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "keepalive must exit once the write channel is closed"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let _ = handle.await;
-    }
-
-    /// A connection that keeps receiving frames (a "live" peer that pongs) is
-    /// NOT reaped: the keepalive task must leave healthy tunnels alone.
-    #[tokio::test(flavor = "current_thread")]
-    async fn keepalive_keeps_live_tunnel() {
-        let pool = dummy_pool();
-        let conn = Connection::new(Arc::downgrade(&pool));
-        let cancel = conn.cancel.clone();
-        let (write_tx, _rx) = mpsc::channel::<Message>(8);
-        conn.set_status(Status::Idle);
-
-        let liveness = Duration::from_millis(30);
-        let check = Duration::from_millis(20);
-        let ping = Duration::from_millis(50);
-
-        // Simulate the driver refreshing last_activity on every received pong
-        // (well within the liveness window), as a live peer would.
-        let conn_for_refresher = conn.clone();
-        let refresher = tokio::spawn(async move {
-            loop {
-                *conn_for_refresher.last_activity.lock().unwrap() = Instant::now();
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        });
-
-        let handle = tokio::spawn(keepalive_loop(
-            conn.clone(),
-            write_tx,
-            cancel.clone(),
-            liveness,
-            check,
-            ping,
-        ));
-
-        // Let the keepalive loop run well past several check-intervals (real
-        // time). The connection must stay alive.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_ne!(
-            conn.status(),
-            Status::Closed,
-            "a live tunnel that keeps receiving frames must not be reaped"
-        );
-
-        handle.abort();
-        refresher.abort();
-        cancel.cancel();
-    }
-
-    /// A connection that is RUNNING (actively proxying a request) is NOT
-    /// reaped even if `last_activity` is stale. During a long streamed
-    /// response the shared write queue can stay full, dropping keepalive
-    /// pings; the server only pongs in response to a ping, so no pong
-    /// refreshes `last_activity`. Reaping then would break an in-flight
-    /// request — so the reaper only applies to Idle connections (mirroring
-    /// the server, which only liveness-reaps Idle, not Busy, connections).
-    #[tokio::test(flavor = "current_thread")]
-    async fn keepalive_never_reaps_running_tunnel() {
-        let pool = dummy_pool();
-        let conn = Connection::new(Arc::downgrade(&pool));
-        let cancel = conn.cancel.clone();
-        // A capped channel that we NEVER drain, so pings are dropped on every
-        // `try_send` (Full) — simulating a streamed response backpressuring the
-        // shared write queue. No pong ever comes back, so `last_activity` only
-        // grows.
-        let (write_tx, _rx) = mpsc::channel::<Message>(8);
-        conn.set_status(Status::Running);
-
-        let handle = tokio::spawn(keepalive_loop(
-            conn.clone(),
-            write_tx,
-            cancel.clone(),
-            // liveness (30ms) < check (20ms)*several; many wake-ups pass with a
-            // stale last_activity while Running.
-            Duration::from_millis(30),
-            Duration::from_millis(20),
-            Duration::from_millis(50),
-        ));
-
-        // Run well past several liveness timeouts. The connection must stay
-        // alive because it is Running (an in-flight request).
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            conn.status(),
-            Status::Running,
-            "a Running (in-flight) tunnel must never be reaped, even with a \
-             stale last_activity and a full write queue"
-        );
-
-        handle.abort();
-        cancel.cancel();
     }
 
     /// A connection that never became usable (connect failed before the
@@ -1193,6 +1074,10 @@ mod tests {
             rx
         }
 
+        /// A stale-after threshold large enough to never trigger in the
+        /// tests that do not exercise the wedge backstop.
+        const FAR_FUTURE: Duration = Duration::from_secs(3600);
+
         /// A pong arriving after the probe ping was sent => Ok.
         #[tokio::test(flavor = "current_thread")]
         async fn probe_reports_ok_when_pong_arrives() {
@@ -1205,7 +1090,8 @@ mod tests {
             // 5s deadline: the happy path still settles in ~ms (the responder
             // task runs at the first await); the margin only absorbs a
             // heavily loaded test runner so the case never flakes.
-            let probe = tokio::spawn(async move { probing.probe(Duration::from_secs(5)).await });
+            let probe =
+                tokio::spawn(async move { probing.probe(Duration::from_secs(5), FAR_FUTURE).await });
             // Fake server: the probe's ping arrives, then the pong comes back
             // (the driver records it via record_pong).
             let ping = rx.recv().await.expect("probe must send a ping");
@@ -1225,7 +1111,7 @@ mod tests {
             conn.set_status(Status::Idle);
             let _rx = wire_probe_tx(&conn); // never answers
             assert_eq!(
-                conn.probe(Duration::from_millis(60)).await,
+                conn.probe(Duration::from_millis(60), FAR_FUTURE).await,
                 ProbeOutcome::Dead
             );
         }
@@ -1239,7 +1125,7 @@ mod tests {
                 let conn = Connection::new(Arc::downgrade(&pool));
                 conn.set_status(status);
                 assert_eq!(
-                    conn.probe(Duration::from_millis(20)).await,
+                    conn.probe(Duration::from_millis(20), FAR_FUTURE).await,
                     ProbeOutcome::Skipped,
                     "{status:?} must not be probed"
                 );
@@ -1254,24 +1140,71 @@ mod tests {
             let conn = Connection::new(Arc::downgrade(&pool));
             conn.set_status(Status::Idle);
             assert_eq!(
-                conn.probe(Duration::from_millis(20)).await,
+                conn.probe(Duration::from_millis(20), FAR_FUTURE).await,
                 ProbeOutcome::Dead
             );
         }
 
-        /// Write queue momentarily full (a streamed response just finished
-        /// filling the shared buffer) => inconclusive: Skipped, never killed
-        /// on a maybe. The passive keepalive reaper still covers this tunnel.
+        /// Write queue full but the link is FRESH (frames were arriving
+        /// recently — a streamed response just finished filling the buffer)
+        /// => inconclusive: Skipped, retried next round.
         #[tokio::test(flavor = "current_thread")]
-        async fn probe_skips_when_write_queue_is_full() {
+        async fn probe_skips_full_queue_when_activity_is_fresh() {
             let pool = dummy_pool();
             let conn = Connection::new(Arc::downgrade(&pool));
             conn.set_status(Status::Idle);
             let (tx, _rx) = mpsc::channel::<Message>(1); // never drained
             *conn.probe_tx.lock().unwrap() = Some(tx.clone());
             tx.try_send(Message::text("fill")).unwrap();
+            *conn.last_activity.lock().unwrap() = Instant::now(); // fresh
             assert_eq!(
-                conn.probe(Duration::from_millis(20)).await,
+                conn.probe(Duration::from_millis(20), Duration::from_secs(90)).await,
+                ProbeOutcome::Skipped
+            );
+        }
+
+        /// The wedge backstop — the ONE case the removed passive reaper
+        /// uniquely covered: the write queue is full (the driver is wedged,
+        /// so the probe cannot even enqueue its ping) AND no frame at all has
+        /// arrived for longer than `stale_after`. That combination cannot
+        /// belong to a healthy tunnel: a live driver drains the queue within
+        /// ~RTT, so a permanently-full queue plus a silent link is dead.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_kills_wedged_tunnel_when_queue_full_and_silent() {
+            let pool = dummy_pool();
+            let conn = Connection::new(Arc::downgrade(&pool));
+            conn.set_status(Status::Idle);
+            let (tx, _rx) = mpsc::channel::<Message>(1); // never drained
+            *conn.probe_tx.lock().unwrap() = Some(tx.clone());
+            tx.try_send(Message::text("fill")).unwrap(); // queue full
+            // checked_sub: never construct a pre-epoch Instant (would panic).
+            let stale = Instant::now()
+                .checked_sub(Duration::from_secs(300))
+                .unwrap_or_else(Instant::now);
+            *conn.last_activity.lock().unwrap() = stale;
+            assert_eq!(
+                conn.probe(Duration::from_millis(20), Duration::from_secs(90)).await,
+                ProbeOutcome::Dead
+            );
+        }
+
+        /// Full + silent but the tunnel went Running during the probe (a
+        /// request just arrived) => Skipped, not killed — data is flowing.
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_skips_wedged_lookalike_that_turned_running() {
+            let pool = dummy_pool();
+            let conn = Connection::new(Arc::downgrade(&pool));
+            conn.set_status(Status::Idle);
+            let (tx, _rx) = mpsc::channel::<Message>(1); // never drained
+            *conn.probe_tx.lock().unwrap() = Some(tx.clone());
+            tx.try_send(Message::text("fill")).unwrap();
+            let stale = Instant::now()
+                .checked_sub(Duration::from_secs(300))
+                .unwrap_or_else(Instant::now);
+            *conn.last_activity.lock().unwrap() = stale;
+            conn.set_status(Status::Running);
+            assert_eq!(
+                conn.probe(Duration::from_millis(20), Duration::from_secs(90)).await,
                 ProbeOutcome::Skipped
             );
         }

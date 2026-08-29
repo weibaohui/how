@@ -11,6 +11,22 @@ use tokio_util::sync::CancellationToken;
 /// Cap for the connector's exponential failure backoff (2, 4, 8, 16, 32, 60s).
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Run `f` in an isolated task so a panic inside it cannot kill the calling
+/// loop (tokio aborts only the panicking child). The caller is told via
+/// `JoinError` but keeps ticking.
+async fn panic_safe<F>(label: &str, f: F) -> Result<(), tokio::task::JoinError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(f).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::log(format!("{label} panicked ({e}); continuing next interval"));
+            Err(e)
+        }
+    }
+}
+
 /// Pool manage a pool of connection to a remote Server.
 pub struct Pool {
     client: Arc<ClientInner>,
@@ -148,7 +164,15 @@ impl Pool {
                     tokio::select! {
                         _ = this.done.cancelled() => break,
                         _ = tokio::time::sleep(interval) => {
-                            this.health_round(PROBE_DEADLINE).await;
+                            // Panic isolation: with the per-connection passive
+                            // reaper gone, the health round is the ONLY
+                            // dead-tunnel detection. A panic must not silently
+                            // kill this loop for the whole pool.
+                            let round = this.clone();
+                            let _ = panic_safe("pool health round", async move {
+                                round.health_round(PROBE_DEADLINE).await;
+                            })
+                            .await;
                         }
                     }
                 }
@@ -217,8 +241,15 @@ impl Pool {
             }
         }
         let started = Instant::now();
+        // Wedge backstop: `livenesstimeout` is now only the staleness
+        // threshold for tunnels whose write queue is too full to be probed
+        // (see `Connection::probe`).
+        let stale_after = Duration::from_millis(self.client.config.liveness_timeout.max(0) as u64);
         let outcomes = join_all(idle_conns.iter().map(|conn| async move {
-            (conn.clone(), conn.probe(probe_deadline).await)
+            (
+                conn.clone(),
+                conn.probe(probe_deadline, stale_after).await,
+            )
         }))
         .await;
 
@@ -735,6 +766,57 @@ mod tests {
         assert!(conns.iter().any(|c| Arc::ptr_eq(c, &healthy[0])));
         // Healthy idle exists -> connector only warms the total up to 10.
         assert_eq!(conns.len(), 10);
+    }
+
+    /// The wedge backstop end-to-end through a health round: an idle tunnel
+    /// whose write queue is full (cannot be probed) AND that has been silent
+    /// for longer than `livenesstimeout` is closed and replaced — the one
+    /// case the removed per-connection passive reaper uniquely covered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_kills_wedged_tunnel_with_full_queue_and_stale_activity() {
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let pool = dummy_pool();
+        let conn = Connection::new(Arc::downgrade(&pool));
+        conn.set_status(Status::Idle);
+        let long_alive = Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .unwrap_or_else(Instant::now);
+        conn.set_connected_at(Some(long_alive));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1); // never drained
+        *conn.probe_tx.lock().unwrap() = Some(tx.clone());
+        tx.try_send(Message::text("fill")).unwrap(); // queue full
+        conn.set_last_activity(long_alive); // silent ever since
+        pool.connections.lock().unwrap().push(conn.clone());
+
+        pool.health_round(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            conn.status(),
+            Status::Closed,
+            "a wedged tunnel (full queue + silent) must be closed by the round"
+        );
+        let conns = pool.connections.lock().unwrap();
+        assert_eq!(
+            conns.len(),
+            10,
+            "0 available -> deficit dialed back to the target total"
+        );
+    }
+
+    /// A panic inside a health round must not kill the health loop: with the
+    /// passive reaper gone, the round is the ONLY dead-tunnel detection, so
+    /// every round runs in an isolated child task (tokio aborts just the
+    /// panicking child) and the loop keeps ticking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn panic_safe_task_isolates_panics() {
+        let boom = panic_safe("test round", async { panic!("boom") });
+        assert!(
+            boom.await.is_err(),
+            "a panicking round must surface a JoinError to the loop, not abort it"
+        );
+        let fine = panic_safe("test round", async {});
+        assert!(fine.await.is_ok());
     }
 
     /// While in dial backoff with an EMPTY pool (the server was down and has
