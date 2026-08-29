@@ -145,6 +145,8 @@ port : 8080                 # bind port
 timeout : 1000              # ms to wait for an idle WS tunnel before returning 526
 idletimeout : 60000         # ms before closing excess idle tunnels
 livenesstimeout : 120000    # ms before closing a silent (half-open) idle tunnel
+dispatchfreshness : 75000   # ms: an idle tunnel silent this long is closed, not dispatched
+busylivenesstimeout : 600000 # ms: a busy tunnel silent this long is closed (partition fuse)
 secretkey : ThisIsASecret   # shared secret; must match every client's secretkey
 ```
 
@@ -169,7 +171,18 @@ rely on detecting it:
   *no* frame (ping/pong/data) for this long is treated as half-open and
   closed, so the next request is never handed to a dead tunnel. When a
   tunnel dies, this reaps dead links in ~2 minutes instead of waiting for the
-  OS TCP keepalive (~2 hours).
+  OS TCP keepalive (~2 hours). Two tighter guards sit in front of it:
+  **dispatch freshness** (`dispatchfreshness`, default 75 s — ~2.5× the
+  client's 30 s ping cadence) closes an idle tunnel that has been silent
+  this long *instead of dispatching a request to it*, so a tunnel the
+  client has not yet noticed is dead never receives one; and the **busy
+  fuse** (`busylivenesstimeout`, default 600 s) closes a *busy* tunnel that
+  has received nothing for this long — the last-resort bound for a
+  bidirectionally partitioned link, where the client's close can never
+  arrive and a request with no `upstreamtimeout` would otherwise hang
+  forever (a busy tunnel serving traffic constantly receives frames; keep
+  the value above your longest legitimate silent phase: slow upload, hung
+  upstream, SSE gaps).
 - **Client side** (the periodic pool health round, `healthcheckinterval`
   default 30 s — see below): the client actively PROBES every idle tunnel
   (ping → wait for the pong, 10 s deadline) and closes the ones that do not
@@ -194,7 +207,15 @@ passive per-connection reaper (which needed up to 90 s of total silence to
 `livenesstimeout` survives only as the wedge backstop described above. If
 the pool is completely empty while the connector is backing off (the server
 was down and came back), each round still dials one rescue tunnel at the
-health cadence, so recovery no longer waits out the backoff.
+health cadence, so recovery no longer waits out the backoff. The round also
+covers the two states a probe cannot test: a **Running** tunnel that has
+both received *and* sent nothing for `livenesstimeout` (clamped to a 60 s
+floor — a healthy one waiting for upstream first bytes still gets the 30 s
+keepalive ping out, refreshing its write watermark; both stale means the
+driver is wedged on a half-open link mid-request) is closed so its capacity
+returns, and a **Connecting** tunnel stuck past its budget (3×
+`tunneltimeout`, or 60 s when unset) is closed so a peer that accepts TCP
+and goes silent can never leak pool capacity forever.
 
 ### Optional security gatekeepers
 
@@ -252,7 +273,7 @@ routes :
 | `targets` | One or more `/register` URLs to dial out to. The client opens a connection pool to each. |
 | `poolidlesize` | Idle tunnels kept warm per server. Raises it for low-latency first byte. |
 | `poolmaxsize` | Hard cap on concurrent tunnels per server. Size to your peak concurrency; beyond it the server waits up to `timeout` ms then returns 526. |
-| `livenesstimeout` | Wedge backstop (ms): an idle tunnel whose write queue is too full to be probed AND that has received no frame for this long is closed as dead. Normal dead-link detection is the active health-round probe (ping → pong within its own 10 s deadline), which replaced the old passive reaper — so any positive value is now used as-is (no ping-cadence floor anymore). Default 90000. 0 = default. |
+| `livenesstimeout` | Wedge backstop (ms): an idle tunnel whose write queue is too full to be probed AND that has received no frame for this long is closed as dead. Also the Running-tunnel reap threshold: a running tunnel that has both received AND sent nothing for this long (clamped up to a 60 s floor, since a healthy waiting tunnel only sends at the 30 s ping cadence) is wedged on a half-open link and closed. Normal dead-link detection is the active health-round probe (ping → pong within its own 10 s deadline), which replaced the old passive reaper — so any positive value is now used as-is (no ping-cadence floor anymore). Default 90000. 0 = default. |
 | `healthcheckinterval` | Cadence (ms) of the periodic pool health round: actively probe every idle tunnel (ping → wait for the pong, 10 s deadline), log each tunnel's status, close the unresponsive ones, and dial replacements so the pool always holds `poolidlesize` *verified-available* tunnels. When the pool is completely empty and the connector is in dial backoff (up to 60 s after consecutive failures), each round still dials one rescue tunnel — the health cadence itself bounds the retry rate — so the server regains a tunnel within ~one interval after it comes back, without restarting the client. Default 30000; must exceed the 10 s probe deadline (below it falls back to the default and logs a warning). 0 = default. |
 | `secretkey` | Sent as `X-SECRET-KEY` on the WebSocket handshake. Must equal the server's `secretkey` or the tunnel is rejected (→ 526). |
 | `routes` | The **arrival host → upstream base** map. The arrival host is the `Host` the caller targets on the server (`127.0.0.1:8080`, `llm.example.com`). The client appends the request path + query to the upstream base. Matching tries `host:port` first, then `host`. |
