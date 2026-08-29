@@ -183,11 +183,13 @@ impl Pool {
         //                                   top-ups while idle ones remain.
         //   - every tunnel busy, below    -> add one (capacity expansion on
         //     pool_max_size                  real demand, capped).
+        // The warm-up target is clamped to pool_max_size (a misconfigured
+        // idle size above the max must not punch through the cap).
         // Note for the expansion case: the new tunnel takes ~1 tick + RTT
         // to register; callers wait at most the server's `timeout` for it —
         // raise that if peak concurrency approaches pool_idle_size.
-        let idle_target = self.client.config.pool_idle_size.max(0) as usize;
         let max = self.client.config.pool_max_size.max(0) as usize;
+        let idle_target = (self.client.config.pool_idle_size.max(0) as usize).min(max);
         let to_create: i64 = if size.idle > 0 {
             0
         } else if size.total < idle_target {
@@ -460,5 +462,27 @@ mod tests {
         seed(&pool, 100, Status::Running);
         pool.connector();
         assert_eq!(total(&pool), 100, "at max: no expansion");
+    }
+
+    /// A misconfigured idle size ABOVE the max must not punch through the
+    /// cap: the warm-up target is clamped to pool_max_size (regression: the
+    /// first version of the warm-up branch dialed idle_size in one pass).
+    #[tokio::test(flavor = "current_thread")]
+    async fn connector_caps_warmup_at_max_when_idle_target_exceeds_max() {
+        let mut config = new_config();
+        config.pool_idle_size = 200;
+        config.pool_max_size = 100;
+        let inner = Arc::new(ClientInner {
+            config: Arc::new(config),
+            http_client: reqwest::Client::new(),
+        });
+        let pool = Pool::new(
+            inner,
+            "ws://test.invalid/register".to_string(),
+            "k".to_string(),
+            CancellationToken::new(),
+        );
+        pool.connector(); // cold pool: warm-up, clamped to max
+        assert_eq!(total(&pool), 100, "warm-up must stop at pool_max_size");
     }
 }
