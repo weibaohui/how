@@ -558,11 +558,17 @@ async fn handle_register(inner: Arc<Inner>, req: Request<Incoming>) -> Response<
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let accept = handshake::derive_accept_key(key.as_bytes());
+    // The server is the single numbering authority: assign the tunnel
+    // number here and announce it in the handshake response header — the
+    // client adopts it, so both ends log the same `tunnel#N` for this
+    // connection and numbers never duplicate across clients.
+    let conn_id = crate::server::connection::next_conn_id();
     let resp = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("upgrade", "websocket")
         .header("connection", "Upgrade")
         .header("sec-websocket-accept", accept)
+        .header("X-TUNNEL-ID", conn_id.to_string())
         .body(Full::new(Bytes::new()).boxed())
         .unwrap();
 
@@ -578,15 +584,17 @@ async fn handle_register(inner: Arc<Inner>, req: Request<Incoming>) -> Response<
         };
         let io = TokioIo::new(upgraded);
         let ws = WebSocketStream::from_raw_socket(io, Role::Server, None).await;
-        register_websocket(inner_clone, ws).await;
+        register_websocket(inner_clone, ws, conn_id).await;
     });
 
     resp
 }
 
 /// Read the greeting message (`<id>_<poolsize>`), find or create the pool for
-/// the client id, update its size, and register the websocket connection.
-async fn register_websocket<S>(inner: Arc<Inner>, mut ws: WebSocketStream<S>)
+/// the client id, update its size, and register the websocket connection
+/// under its server-assigned `conn_id` (already announced to the client in
+/// the handshake response).
+async fn register_websocket<S>(inner: Arc<Inner>, mut ws: WebSocketStream<S>, conn_id: u64)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -637,5 +645,5 @@ where
         }
     };
     pool.set_size(size);
-    pool.register(ws);
+    pool.register(ws, conn_id);
 }

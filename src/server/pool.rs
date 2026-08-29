@@ -40,8 +40,9 @@ impl Pool {
         })
     }
 
-    /// Register a new websocket connection into the pool.
-    pub fn register<S>(&self, ws: WebSocketStream<S>)
+    /// Register a new websocket connection into the pool under its
+    /// server-assigned `conn_id` (announced to the client at handshake).
+    pub fn register<S>(&self, ws: WebSocketStream<S>, conn_id: u64)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
@@ -51,7 +52,7 @@ impl Pool {
                 return;
             }
         }
-        let conn = Connection::new(self.id.clone(), ws, self.idle_tx.clone());
+        let conn = Connection::new(self.id.clone(), conn_id, ws, self.idle_tx.clone());
         let mut conns = self.connections.lock().unwrap();
         conns.push(conn);
     }
@@ -86,8 +87,8 @@ impl Pool {
                     let last_activity_ms = connection.last_activity().elapsed().as_millis() as i64;
                     if last_activity_ms > self.liveness_timeout_ms {
                         log::log(format!(
-                            "Reaping half-open connection from {} (no frame for {}ms)",
-                            connection.pool_id, last_activity_ms
+                            "Reaping half-open tunnel#{} from {} (no frame for {}ms)",
+                            connection.id, connection.pool_id, last_activity_ms
                         ));
                         connection.close();
                     } else {

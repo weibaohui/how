@@ -67,10 +67,25 @@ pub enum Status {
     Closed = 3,
 }
 
+/// Monotonic tunnel IDs: every `Connection` gets a process-unique number so
+/// logs can be correlated — which tunnel served which request, which tunnel
+/// was reaped, which one died young. 1-based (0 would read as "unset").
+static NEXT_TUNNEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// A single websocket connection to a WSP server.
 pub struct Connection {
     pub pool: Weak<Pool>,
+    /// Tunnel number. The SERVER is the single numbering authority (its
+    /// counter is global, so numbers never duplicate across clients); it
+    /// assigns the number in the handshake response header `X-TUNNEL-ID`,
+    /// and from then on BOTH ends log the same `tunnel#N` for this
+    /// connection. Before the handshake completes (and for dials that never
+    /// get there) a provisional client-local number is used — such tunnels
+    /// never existed server-side, so no cross-end correlation is needed.
+    id: Mutex<u64>,
     status: Mutex<Status>,
+    /// Requests served over this tunnel (logged on close).
+    served: std::sync::atomic::AtomicU64,
     /// Last time any frame was received from the server (pong/data/ping).
     /// Refreshed by the driver on every read; checked by the keepalive task
     /// to detect half-open links (no traffic => the peer or the path is
@@ -92,12 +107,20 @@ impl Connection {
     pub fn new(pool: Weak<Pool>) -> Arc<Self> {
         Arc::new_cyclic(|weak: &Weak<Connection>| Connection {
             pool,
+            id: Mutex::new(NEXT_TUNNEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            served: std::sync::atomic::AtomicU64::new(0),
             status: Mutex::new(Status::Connecting),
             last_activity: Mutex::new(Instant::now()),
             connected_at: Mutex::new(None),
             cancel: CancellationToken::new(),
             self_weak: weak.clone(),
         })
+    }
+
+    /// The tunnel number (server-assigned once the handshake completed;
+    /// provisional client-local before that).
+    pub fn id(&self) -> u64 {
+        *self.id.lock().unwrap()
     }
 
     /// Last time any frame was received from the peer (used by the keepalive
@@ -123,7 +146,10 @@ impl Connection {
         http_client: reqwest::Client,
         config: Arc<crate::client::ClientConfig>,
     ) -> Result<(), String> {
-        log::log(format!("Connecting to {}", target));
+        // The number shown here is the provisional client-local one; the
+        // authoritative server-assigned number appears in the "Connected
+        // tunnel#N" line right after the handshake.
+        log::log(format!("Connecting tunnel#{} to {}", self.id(), target));
 
         let mut req = target
             .to_string()
@@ -156,14 +182,25 @@ impl Connection {
         )
         .await?;
         let _ = stream.set_nodelay(true);
-        let (ws, _resp) = with_deadline(
+        let (ws, resp) = with_deadline(
             tunnel_deadline,
             "websocket handshake",
             tokio_tungstenite::client_async(req, stream),
         )
         .await?;
 
-        log::log(format!("Connected to {}", target));
+        // Adopt the SERVER-assigned tunnel number from the handshake
+        // response — the server is the single numbering authority, so from
+        // here on both ends log the same `tunnel#N` for this connection.
+        if let Some(id) = resp
+            .headers()
+            .get("X-TUNNEL-ID")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            *self.id.lock().unwrap() = id;
+        }
+        log::log(format!("Connected tunnel#{} to {}", self.id(), target));
 
         // Greeting: `<id>_<pool_idle_size>`.
         let greeting = format!("{}_{}", proxy_id, pool_idle_size);
@@ -250,6 +287,22 @@ impl Connection {
         };
         if already {
             return;
+        }
+        // Lifecycle summary: one line per tunnel death, with the id and what
+        // it accomplished — pairs with the per-request "[tunnel#N …]" lines.
+        let served = self.served.load(std::sync::atomic::Ordering::Relaxed);
+        match self.connected_at() {
+            Some(t) => log::log(format!(
+                "tunnel#{} closed (lived {}s, served {} request{})",
+                self.id(),
+                t.elapsed().as_secs(),
+                served,
+                if served == 1 { "" } else { "s" }
+            )),
+            None => log::log(format!(
+                "tunnel#{} closed (never connected — dial/handshake failed)",
+                self.id()
+            )),
         }
         if let Some(pool) = self.pool.upgrade() {
             let stable = is_stable_lifetime(self.connected_at().map(|t| t.elapsed()));
@@ -402,7 +455,8 @@ async fn keepalive_loop(
                     // 完全消除（除非在持锁状态下决策），但此重检已足够。
                     if conn.status() == Status::Idle {
                         log::log(format!(
-                            "Reaping half-open tunnel: no frame from server for {}ms",
+                            "Reaping half-open tunnel#{}: no frame from server for {}ms",
+                            conn.id(),
                             idle.as_millis()
                         ));
                         conn.shutdown();
@@ -474,7 +528,16 @@ async fn serve(
             }
         };
 
-        log::log(format!("[{}] {}", http_req.method, http_req.url));
+        // Count and log the request WITH the tunnel id: "which request went
+        // through which websocket" is then a single `grep tunnel#N`.
+        conn.served
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::log(format!(
+            "[tunnel#{} {}] {}",
+            conn.id(),
+            http_req.method,
+            http_req.url
+        ));
 
         // Apply the client's blacklist / whitelist.
         let denied = check_rules(&config, &http_req);
@@ -943,6 +1006,22 @@ mod tests {
     /// greeting) must be scored as a failure: `is_stable_lifetime(None)` is
     /// false, so the pool connector backs off instead of hammering an
     /// unreachable server.
+    /// Pre-connect ids are process-unique and monotonically increasing; the
+    /// authoritative server-assigned number arrives with the handshake
+    /// response header and replaces it (see connect()).
+    #[test]
+    fn provisional_tunnel_ids_are_unique_and_monotonic() {
+        let pool = dummy_pool();
+        let a = Connection::new(Arc::downgrade(&pool));
+        let b = Connection::new(Arc::downgrade(&pool));
+        let c = Connection::new(Arc::downgrade(&pool));
+        assert!(
+            a.id() < b.id() && b.id() < c.id(),
+            "provisional ids must be unique monotonic"
+        );
+        assert!(a.id() >= 1, "ids are 1-based");
+    }
+
     #[test]
     fn outcome_never_connected_is_a_failure() {
         assert!(!is_stable_lifetime(None));

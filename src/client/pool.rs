@@ -25,6 +25,11 @@ pub struct Pool {
     /// Deadline until which `connector()` refuses to dial. `None` when not
     /// backing off. Set by `note_outcome(false)`, cleared by `note_outcome(true)`.
     backoff_until: Mutex<Option<Instant>>,
+    /// Last pool-composition snapshot that was logged. The stats line prints
+    /// only when the composition CHANGES (tunnel connected / closed / a
+    /// request flipped Idle<->Running), so steady state adds no log noise
+    /// while "how many websockets does the pool have" stays one grep away.
+    last_stats: Mutex<Option<(usize, usize, usize)>>,
 }
 
 /// Number of open connections per status.
@@ -52,6 +57,7 @@ impl Pool {
             self_weak: weak.clone(),
             failures: Mutex::new(0),
             backoff_until: Mutex::new(None),
+            last_stats: Mutex::new(None),
         })
     }
 
@@ -104,16 +110,41 @@ impl Pool {
 
     /// Start the pool: connect once, then refresh every second.
     pub fn start(self: Arc<Self>) {
+        self.log_stats_if_changed();
         self.connector();
         let this = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = this.done.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => this.connector(),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        this.log_stats_if_changed();
+                        this.connector();
+                    }
                 }
             }
         });
+    }
+
+    /// Log "pool: N tunnels (connecting=X, idle=Y, running=Z)" whenever the
+    /// composition changes since the previous line. Checked on the 1s tick,
+    /// so a transition is reflected at most one second after it happens.
+    fn log_stats_if_changed(&self) {
+        let snapshot = {
+            let conns = self.connections.lock().unwrap();
+            let size = self.size_locked(&conns);
+            (size.connecting, size.idle, size.running)
+        };
+        let mut last = self.last_stats.lock().unwrap();
+        if *last != Some(snapshot) {
+            *last = Some(snapshot);
+            let (connecting, idle, running) = snapshot;
+            let total = connecting + idle + running;
+            log::log(format!(
+                "pool: {total} tunnel{} (connecting={connecting}, idle={idle}, running={running})",
+                if total == 1 { "" } else { "s" }
+            ));
+        }
     }
 
     /// Ensure enough idle connections, up to `PoolMaxSize`. Create only one
