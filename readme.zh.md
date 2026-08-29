@@ -43,7 +43,7 @@
 
 ### 请求生命周期（单次代理流程）
 
-1. **客户端维护一个常驻隧道池。** 启动时，它用共享的 `secretkey`（通过 `X-SECRET-KEY` 头）连接到服务端的 `/register`，发送 `<id>_<poolsize>` 作为身份标识，并保持 `poolidlesize` 条空闲 WebSocket 连接；负载上升时按需扩容到 `poolmaxsize`。
+1. **客户端维护一个常驻隧道池。** 启动时，它用共享的 `secretkey`（通过 `X-SECRET-KEY` 头）连接到服务端的 `/register`，发送 `<id>_<poolsize>` 作为身份标识，并维护一个共 `poolidlesize` 条（空闲+在忙都计入）的 WebSocket 隧道池：始终优先使用池内空闲隧道，仅在冷池补温到该总量、或全部隧道忙时每次 +1 地扩容，上限 `poolmaxsize`。
 2. **调用方发起普通 HTTP 请求**到服务端——路径任意，并自行携带 `Authorization`、`Content-Type` 等头。
 3. **服务端依次执行可选的准入校验**（来源 IP → API key → 绑定域名），随后依据请求的 `Host` 头与路径还原请求 URL，通过一条空闲隧道转发：请求头作为一帧 JSON 文本，请求体拆为若干二进制帧，最后以一个空帧收尾。
 4. **客户端解析路由：** 依据 `routes` 将请求 Host 映射到上游 base URL，再追加请求路径与查询参数，用 `reqwest` 向真实上游发起请求；请求体上行、响应体下行均按流式传输。
@@ -151,7 +151,7 @@ secretkey : ThisIsASecret   # 共享密钥；必须与每个客户端的 secretk
 ---
 targets :                            # 要出站连接的 HOW 服务端
  - ws://127.0.0.1:8080/register
-poolidlesize : 10                    # 每个服务端维持的空闲 WS 隧道数
+poolidlesize : 10                    # 每个服务端的隧道总量目标（空闲+在忙计入）；按需创建
 poolmaxsize : 100                    # 每个服务端的并发 WS 隧道硬上限
 livenesstimeout : 90000              # 静默隧道被回收重连前的毫秒数
 secretkey : ThisIsASecret            # 必须与服务端的 secretkey 一致
@@ -169,7 +169,7 @@ routes :
 | 字段 | 含义 |
 |-------|---------|
 | `targets` | 一个或多个 `/register` URL，由客户端主动发起出站连接。客户端对每个 target 维护一个连接池。 |
-| `poolidlesize` | 每个服务端维持的空闲隧道数。调高可降低首字节延迟。 |
+| `poolidlesize` | 每个服务端的隧道总量目标（空闲+在忙都计入）。始终优先复用池内空闲隧道；仅在池子未达该总量时补温、或全部隧道忙时每次 +1 扩容。调高可降低首字节延迟。 |
 | `poolmaxsize` | 每个服务端的并发隧道硬上限。按峰值并发设置；超出时服务端最多等待 `timeout` 毫秒后返回 526。 |
 | `livenesstimeout` | 一条隧道若在此毫秒数内**未收到任何帧**（pong/数据）即视为半开并关闭，由连接池重拨补上。默认 90000（90s，小于服务端的 120s，故客户端会在服务端回收整个 pool 之前自愈）。必须大于 ~2× 30s ping 周期（低于 60000ms 无法可靠观测到两次 pong、会把健康链路误杀；过小值会回退默认并打告警日志）。0 = 默认。 |
 | `secretkey` | WebSocket 握手时通过 `X-SECRET-KEY` 发送。必须与服务端的 `secretkey` 一致，否则隧道被拒（→ 526）。 |

@@ -57,8 +57,11 @@ Three roles:
 
 1. **The client keeps a warm pool of tunnels.** On startup it dials the
    server's `/register` with the shared `secretkey` (as `X-SECRET-KEY`), sends
-   a `<id>_<poolsize>` greeting, and keeps `poolidlesize` WebSocket
-   connections idle, topping up to `poolmaxsize` under load.
+   a `<id>_<poolsize>` greeting, and keeps a pool of `poolidlesize`
+   WebSocket tunnels (idle + busy both count). Existing idle tunnels are
+   always preferred; new ones are dialed only to warm a cold pool up to
+   that total, or +1 at a time when every tunnel is busy, up to
+   `poolmaxsize`.
 2. **The caller sends a normal HTTP request** to the server — any path, with
    its own headers (`Authorization`, `Content-Type`, custom).
 3. **The server validates** its optional gatekeepers (source IP → API key →
@@ -214,7 +217,7 @@ Client config is a YAML file (`config.client.example.cfg`):
 ---
 targets :                            # HOW servers to dial out to
  - ws://127.0.0.1:8080/register
-poolidlesize : 10                    # idle WS tunnels kept warm per server
+poolidlesize : 10                    # tunnel target per server (idle+busy count); demand-driven
 poolmaxsize : 100                    # max concurrent WS tunnels per server
 livenesstimeout : 90000              # ms before a silent tunnel is reaped & reconnected
 secretkey : ThisIsASecret            # must match the server's secretkey

@@ -158,10 +158,13 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.targets.is_empty() {
         config.targets = default_targets();
     }
-    if config.pool_idle_size == 0 {
+    // Non-positive pool sizes are "unset" too: a negative idle size would
+    // otherwise degenerate the connector (target 0 -> pure +1/tick creep),
+    // a negative max would forbid every dial.
+    if config.pool_idle_size <= 0 {
         config.pool_idle_size = default_pool_idle_size();
     }
-    if config.pool_max_size == 0 {
+    if config.pool_max_size <= 0 {
         config.pool_max_size = default_pool_max_size();
     }
     // Treat a non-positive duration as "unset" -> use the default. A bare
@@ -288,6 +291,19 @@ mod tests {
             assert!(v <= 0, "{key}: 0 must stay no-limit");
             assert!(v2 <= 0, "{key}: negative must stay no-limit");
         }
+    }
+
+    #[test]
+    fn pool_sizes_non_positive_fall_back_to_defaults() {
+        // 0 and negative both mean "unset": a negative idle size would
+        // degenerate the demand-driven connector into +1/tick creep, so it
+        // must fall back instead of passing through.
+        let c = load_with("poolidlesize: -5");
+        assert_eq!(c.pool_idle_size, default_pool_idle_size());
+        let c = load_with("poolidlesize: 0");
+        assert_eq!(c.pool_idle_size, default_pool_idle_size());
+        let c = load_with("poolmaxsize: -1");
+        assert_eq!(c.pool_max_size, default_pool_max_size());
     }
 
     #[test]
