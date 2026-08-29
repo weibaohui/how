@@ -83,8 +83,7 @@ impl Pool {
                     // wrongly closed as excess idle. The 30-second pings +
                     // this check detect dead links in ~2 minutes instead of
                     // waiting for the OS TCP keepalive (~2 hours).
-                    let last_activity_ms =
-                        connection.last_activity().elapsed().as_millis() as i64;
+                    let last_activity_ms = connection.last_activity().elapsed().as_millis() as i64;
                     if last_activity_ms > self.liveness_timeout_ms {
                         log::log(format!(
                             "Reaping half-open connection from {} (no frame for {}ms)",

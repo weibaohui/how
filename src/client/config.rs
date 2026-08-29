@@ -154,9 +154,8 @@ mod tests {
         );
         let _ = std::fs::create_dir_all(&dir);
         let path = format!("{dir}/client-{}.cfg", uuid::Uuid::new_v4());
-        let yaml = format!(
-            "---\ntargets:\n - ws://127.0.0.1:8080/register\nsecretkey: k\n{liveness}\n"
-        );
+        let yaml =
+            format!("---\ntargets:\n - ws://127.0.0.1:8080/register\nsecretkey: k\n{liveness}\n");
         std::fs::write(&path, yaml).unwrap();
         load_configuration(&path).unwrap()
     }

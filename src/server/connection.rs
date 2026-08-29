@@ -65,7 +65,11 @@ impl Connection {
     /// Spawn a connection over an already-upgraded websocket stream. The
     /// `idle_tx` is the server-wide dispatcher queue the connection offers
     /// itself to whenever it becomes idle.
-    pub fn new<S>(pool_id: String, stream: WebSocketStream<S>, idle_tx: mpsc::Sender<Arc<Connection>>) -> Arc<Self>
+    pub fn new<S>(
+        pool_id: String,
+        stream: WebSocketStream<S>,
+        idle_tx: mpsc::Sender<Arc<Connection>>,
+    ) -> Arc<Self>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
@@ -185,14 +189,9 @@ impl Connection {
     pub async fn send_request_header(&self, req: &HttpRequest) -> Result<(), String> {
         log::log(format!("proxy request to {}", self.pool_id));
 
-        let json_req =
-            serde_json::to_string(req).map_err(|e| format!("Unable to serialize request : {}", e))?;
-        if self
-            .write_tx
-            .send(Message::text(json_req))
-            .await
-            .is_err()
-        {
+        let json_req = serde_json::to_string(req)
+            .map_err(|e| format!("Unable to serialize request : {}", e))?;
+        if self.write_tx.send(Message::text(json_req)).await.is_err() {
             return Err("Unable to write request".to_string());
         }
         Ok(())
