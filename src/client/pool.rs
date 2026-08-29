@@ -157,8 +157,12 @@ impl Pool {
         }
     }
 
-    /// Ensure enough idle connections, up to `PoolMaxSize`. Create only one
-    /// connection if the pool is empty. Mirrors Go's `pool.connector`.
+    /// Demand-driven connection creation (deliberately diverging from Go's
+    /// standing-reserve `pool.connector`): prefer the connections already in
+    /// the pool — while any idle tunnel exists, nothing is dialed. New
+    /// tunnels appear only when the pool is cold (below the
+    /// `pool_idle_size` TOTAL — busy tunnels count toward it) or when every
+    /// tunnel is busy (one per pass, capped by `pool_max_size`).
     ///
     /// No-op while backing off after consecutive connection failures, so a
     /// broken/unavailable server is not hammered once a second.
@@ -169,13 +173,30 @@ impl Pool {
         let mut conns = self.connections.lock().unwrap();
         let size = self.size_locked(&conns);
 
-        let mut to_create = self.client.config.pool_idle_size - size.idle as i64;
-        if size.total == 0 {
-            to_create = 1;
-        }
-        if size.total as i64 + to_create > self.client.config.pool_max_size {
-            to_create = self.client.config.pool_max_size - size.total as i64;
-        }
+        // Prefer the connections already in the pool (demand-driven, not a
+        // standing reserve):
+        //   - ANY idle tunnel exists      -> never dial a new one; requests
+        //                                   are served from the pool.
+        //   - pool below the target TOTAL -> warm up. Busy tunnels count
+        //                                   toward the target, so concurrent
+        //                                   traffic no longer triggers
+        //                                   top-ups while idle ones remain.
+        //   - every tunnel busy, below    -> add one (capacity expansion on
+        //     pool_max_size                  real demand, capped).
+        // Note for the expansion case: the new tunnel takes ~1 tick + RTT
+        // to register; callers wait at most the server's `timeout` for it —
+        // raise that if peak concurrency approaches pool_idle_size.
+        let idle_target = self.client.config.pool_idle_size.max(0) as usize;
+        let max = self.client.config.pool_max_size.max(0) as usize;
+        let to_create: i64 = if size.idle > 0 {
+            0
+        } else if size.total < idle_target {
+            (idle_target - size.total) as i64
+        } else if size.total < max {
+            1
+        } else {
+            0
+        };
         if to_create <= 0 {
             return;
         }
@@ -379,5 +400,65 @@ mod tests {
         conn.shutdown(); // idempotent: must not double-score
         assert_eq!(failures(&pool), 1);
         assert!(pool.in_backoff());
+    }
+
+    /// The demand-driven connector policy. Seed connections directly into
+    /// the pool (statuses included), call connector(), assert the dial
+    /// count. current_thread runtime: the spawned dial tasks never execute
+    /// before the assertions, so only the synchronous pushes are observed.
+    fn seed(pool: &Arc<Pool>, n: usize, status: crate::client::connection::Status) {
+        let mut conns = pool.connections.lock().unwrap();
+        for _ in 0..n {
+            let c = crate::client::connection::Connection::new(Arc::downgrade(pool));
+            c.set_status(status);
+            conns.push(c);
+        }
+    }
+
+    fn total(pool: &Arc<Pool>) -> usize {
+        pool.connections.lock().unwrap().len()
+    }
+
+    /// While ANY idle tunnel exists, nothing is dialed — requests must be
+    /// served from the pool, not by growing it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connector_never_dials_while_idle_exists() {
+        let pool = dummy_pool();
+        seed(&pool, 2, Status::Idle);
+        seed(&pool, 3, Status::Running);
+        pool.connector();
+        assert_eq!(total(&pool), 5, "idle=2 present: no new tunnels");
+    }
+
+    /// Cold pool (all busy, below target TOTAL): warm up to pool_idle_size
+    /// — busy tunnels count toward the target.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connector_warms_to_target_total() {
+        let pool = dummy_pool();
+        seed(&pool, 2, Status::Running);
+        pool.connector();
+        assert_eq!(total(&pool), 10, "2 running -> top up to idle_size total");
+    }
+
+    /// Every tunnel busy at the target: expand by exactly one per pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connector_expands_one_when_all_busy_at_target() {
+        let pool = dummy_pool();
+        seed(&pool, 10, Status::Running);
+        pool.connector();
+        assert_eq!(
+            total(&pool),
+            11,
+            "all busy at target: +1, not a refill burst"
+        );
+    }
+
+    /// At pool_max_size with everything busy: no more dials.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connector_respects_max_size() {
+        let pool = dummy_pool();
+        seed(&pool, 100, Status::Running);
+        pool.connector();
+        assert_eq!(total(&pool), 100, "at max: no expansion");
     }
 }
