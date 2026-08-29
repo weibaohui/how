@@ -5,7 +5,7 @@
 //! client websocket, executed locally by the client, and the response is
 //! streamed back.
 
-use crate::common::{proxy_error_status, HttpRequest};
+use crate::common::{proxy_error_status, HttpRequest, HttpResponse};
 use crate::log;
 use crate::server::config::Config;
 use crate::server::connection::{msg_text, Connection};
@@ -414,52 +414,87 @@ async fn handle_request(
         _ => return proxy_error_response("Unable to get a proxy connection"),
     };
 
-    // Stream the request body to the remote client frame by frame (one binary
-    // message per upstream frame) and finish with an empty end-marker.
-    if let Err(e) = conn.send_request_header(&http_req).await {
-        log::log(e.to_string());
-        conn.close();
-        return proxy_error_response(&e);
-    }
-    {
-        use http_body_util::BodyExt as _;
-        let mut bs = req.into_body().into_stream();
-        while let Some(frame) = bs.next().await {
-            let frame = match frame {
-                Ok(f) => f,
-                Err(e) => {
-                    log::log(format!("unable to read request body : {}", e));
-                    conn.close();
-                    return proxy_error_response("Unable to read request body");
-                }
-            };
-            if let Some(data) = frame.data_ref() {
-                if data.is_empty() {
-                    continue;
-                }
-                if let Err(e) = conn.send_body_chunk(data.clone()).await {
-                    log::log(e.to_string());
-                    conn.close();
-                    return proxy_error_response(&e);
+    // 从发送请求头到接收响应头的全链路超时（`upstreamtimeout` 配置，默认
+    // 30s；只覆盖到响应头为止，响应 body 之后流式回传、不受它限制）。
+    //
+    // 之前仅有"获取连接"的 1s timeout，获取连接后到收到响应头之间完全
+    // 没有超时——一旦 how-client 卡在 IPv6 回退或上游无响应，调用方会
+    // 在这里无限等待，表现为几十秒甚至更久的 hang。
+    //
+    // 默认值与 client 端的 upstreamtimeout 对齐：客户端内部已经会在期限
+    // 内主动返回超时错误，这里再做一次服务端兜底，即使 WebSocket 链路
+    // 异常导致客户端错误传不回来，server 也能自行解挂。
+    let upstream_roundtrip_deadline = Duration::from_millis(inner.config.upstream_timeout as u64);
+    let req_url = http_req.url.clone();
+    let method = http_req.method.clone();
+    let roundtrip_start = Instant::now();
+    let upstream_future = async {
+        // 逐帧流式把请求体写给远端 how-client，最后用空消息标记结束。
+        conn.send_request_header(&http_req)
+            .await
+            .map_err(|e| (e.clone(), e))?;
+        {
+            use http_body_util::BodyExt as _;
+            let mut bs = req.into_body().into_stream();
+            while let Some(frame) = bs.next().await {
+                let frame = frame.map_err(|e| {
+                    let msg = format!("unable to read request body : {}", e);
+                    (msg.clone(), msg)
+                })?;
+                if let Some(data) = frame.data_ref() {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    conn.send_body_chunk(data.clone())
+                        .await
+                        .map_err(|e| (e.clone(), e))?;
                 }
             }
         }
-    }
-    if let Err(e) = conn.send_body_end().await {
-        log::log(e.to_string());
-        conn.close();
-        return proxy_error_response(&e);
-    }
+        conn.send_body_end().await.map_err(|e| (e.clone(), e))?;
 
-    // Read the response header. This arrives as soon as the remote client has
-    // the upstream's headers (before the body completes) so we can return the
-    // status + headers to the caller immediately.
-    let http_resp = match conn.recv_response_header().await {
-        Ok(h) => h,
-        Err(e) => {
-            log::log(e.to_string());
+        // 接收响应头。远端 how-client 一拿到上游的 headers 就会立刻发回
+        // （不等 body），因此调用方可以尽快得到状态码和 headers。
+        let resp = conn
+            .recv_response_header()
+            .await
+            .map_err(|e| (e.clone(), e))?;
+        Ok::<HttpResponse, (String, String)>(resp)
+    };
+
+    let http_resp = match tokio::time::timeout(upstream_roundtrip_deadline, upstream_future).await {
+        Ok(Ok(h)) => {
+            log::log(format!(
+                "代理往返成功：[{}] {} 状态码={} 耗时={}ms",
+                method,
+                req_url,
+                h.status_code,
+                roundtrip_start.elapsed().as_millis()
+            ));
+            h
+        }
+        Ok(Err((log_msg, user_msg))) => {
+            log::log(format!(
+                "代理往返失败：[{}] {} 原因={} 耗时={}ms",
+                method,
+                req_url,
+                log_msg,
+                roundtrip_start.elapsed().as_millis()
+            ));
             conn.close();
-            return proxy_error_response(&e);
+            return proxy_error_response(&user_msg);
+        }
+        Err(_elapsed) => {
+            let waited_ms = roundtrip_start.elapsed().as_millis();
+            log::log(format!(
+                "代理往返超时（upstreamtimeout={}ms）：[{}] {} 已等待={waited_ms}ms",
+                inner.config.upstream_timeout, method, req_url,
+            ));
+            conn.close();
+            return proxy_error_response(&format!(
+                "Proxy request timed out waiting for upstream ({}ms)",
+                inner.config.upstream_timeout
+            ));
         }
     };
 

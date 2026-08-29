@@ -1,5 +1,6 @@
 //! Server configuration.
 
+use crate::log;
 use std::path::Path;
 
 /// Configures a Server. The server is a transparent catch-all reverse proxy:
@@ -23,6 +24,13 @@ pub struct Config {
     /// `0` falls back to the default.
     #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
     pub liveness_timeout: i64,
+    /// Upstream roundtrip deadline (ms): from forwarding a request to a WSP
+    /// client tunnel until that client returns the upstream's response
+    /// headers. Bounds what the HTTP caller waits when a client is stuck on
+    /// a slow/hung upstream; the response BODY streams unbounded after the
+    /// headers arrive. Default 30000. `0`/negative falls back to the default.
+    #[serde(rename = "upstreamtimeout", default = "default_upstream_timeout")]
+    pub upstream_timeout: i64,
     #[serde(rename = "secretkey", default)]
     pub secret_key: String,
     /// Allowed arrival hostnames (the hostname part of the request's `Host`
@@ -58,6 +66,9 @@ fn default_idle_timeout() -> i64 {
 fn default_liveness_timeout() -> i64 {
     120000
 }
+fn default_upstream_timeout() -> i64 {
+    30000
+}
 
 /// Create a new Server config with default values.
 pub fn new_config() -> Config {
@@ -67,6 +78,7 @@ pub fn new_config() -> Config {
         timeout: default_timeout(),
         idle_timeout: default_idle_timeout(),
         liveness_timeout: default_liveness_timeout(),
+        upstream_timeout: default_upstream_timeout(),
         secret_key: String::new(),
         allowed_hosts: Vec::new(),
         allowips: Vec::new(),
@@ -98,5 +110,54 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.liveness_timeout <= 0 {
         config.liveness_timeout = default_liveness_timeout();
     }
+    // Same "non-positive = unset" rule: a negative would panic on the
+    // Duration conversion, a zero would disable the roundtrip guard.
+    if config.upstream_timeout <= 0 {
+        log::log(format!(
+            "upstreamtimeout {}ms is not positive; falling back to default {}ms",
+            config.upstream_timeout,
+            default_upstream_timeout()
+        ));
+        config.upstream_timeout = default_upstream_timeout();
+    }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    //! `upstreamtimeout` bounds what an HTTP caller waits for a WSP client's
+    //! upstream response headers. These tests pin the load-time fallback:
+    //! non-positive / unset values degrade to the safe default while a sane
+    //! value is preserved.
+
+    use super::*;
+
+    fn load_with(upstream_timeout: &str) -> Config {
+        let dir = format!(
+            "{}/wsp-srv-cfg-{}",
+            std::env::temp_dir().to_string_lossy(),
+            std::process::id()
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/server-{}.cfg", uuid::Uuid::new_v4());
+        let yaml = format!("---\nhost: 127.0.0.1\nport: 18080\n{upstream_timeout}\n");
+        std::fs::write(&path, yaml).unwrap();
+        load_configuration(&path).unwrap()
+    }
+
+    #[test]
+    fn upstream_timeout_non_positive_falls_back_to_default() {
+        let c = load_with("upstreamtimeout: 0");
+        assert_eq!(c.upstream_timeout, default_upstream_timeout());
+        let c = load_with("upstreamtimeout: -1");
+        assert_eq!(c.upstream_timeout, default_upstream_timeout());
+        let c = load_with("");
+        assert_eq!(c.upstream_timeout, default_upstream_timeout());
+    }
+
+    #[test]
+    fn upstream_timeout_positive_value_is_preserved() {
+        let c = load_with("upstreamtimeout: 60000");
+        assert_eq!(c.upstream_timeout, 60_000);
+    }
 }
