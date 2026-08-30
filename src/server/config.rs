@@ -1,5 +1,6 @@
 //! Server configuration.
 
+use crate::log;
 use std::path::Path;
 
 /// Configures a Server. The server is a transparent catch-all reverse proxy:
@@ -23,6 +24,35 @@ pub struct Config {
     /// `0` falls back to the default.
     #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
     pub liveness_timeout: i64,
+    /// Dispatch freshness (ms): an idle tunnel that has received no frame at
+    /// all for longer than this is NOT handed to a request — the dispatcher
+    /// closes it and tries the next one. The client pings every 30s, so a
+    /// healthy idle tunnel is never much older than one ping interval; a
+    /// stale one is half-open even if its status still says Idle (the client
+    /// just has not noticed yet). This bounds the "request sent into a dead
+    /// tunnel" window to tunnels that died within the freshness window.
+    /// `0` falls back to the default (75s); a value below 40s cannot
+    /// reliably see one client ping and falls back to the default with a
+    /// warning.
+    #[serde(rename = "dispatchfreshness", default = "default_dispatch_freshness")]
+    pub dispatch_freshness: i64,
+    /// Busy liveness timeout (ms): a BUSY connection that has received no
+    /// frame at all for longer than this is closed. This is the last-resort
+    /// fuse for a bidirectionally partitioned link: the client's close
+    /// cannot reach the server either, and without `upstreamtimeout` the
+    /// proxied request would otherwise hang forever. On a LIVE link the
+    /// client's 30s keepalive pings keep this watermark fresh in EVERY
+    /// request phase (uploads, waiting on upstream headers, SSE gaps all
+    /// included), so the fuse only fires when pings stop arriving at all:
+    /// the link is dead, the client is wedged, or the path is fully
+    /// backlogged (e.g. a caller that stopped reading the response).
+    /// `0` falls back to the default (600s); a value below
+    /// 60s falls back to the default with a warning.
+    #[serde(
+        rename = "busylivenesstimeout",
+        default = "default_busy_liveness_timeout"
+    )]
+    pub busy_liveness_timeout: i64,
     /// Upstream roundtrip deadline (ms): from forwarding a request to a WSP
     /// client tunnel until that client returns the upstream's response
     /// headers. Bounds what the HTTP caller waits when a client is stuck on
@@ -65,6 +95,25 @@ fn default_idle_timeout() -> i64 {
 fn default_liveness_timeout() -> i64 {
     120000
 }
+fn default_dispatch_freshness() -> i64 {
+    // 2.5x the client's fixed 30s ping cadence: a healthy idle tunnel
+    // freshens the server's last-activity watermark ~every 30s, so 75s
+    // tolerates one lost ping while still catching half-open tunnels well
+    // before the 120s idle liveness reaper would.
+    75000
+}
+fn default_busy_liveness_timeout() -> i64 {
+    600000
+}
+
+/// Floor for `dispatchfreshness`: below ~1.3x the client ping cadence a
+/// healthy idle tunnel would be closed between pings (pure churn — the
+/// client would redial it every time). Falls back to the default instead.
+const MIN_DISPATCH_FRESHNESS_MS: i64 = 40000;
+/// Floor for `busylivenesstimeout`: the client's 30s keepalive pings refresh
+/// a busy connection's watermark on any live link, so a value below ~2x that
+/// cadence could false-fire on nothing worse than scheduling jitter.
+const MIN_BUSY_LIVENESS_TIMEOUT_MS: i64 = 60000;
 
 /// Create a new Server config with default values.
 pub fn new_config() -> Config {
@@ -74,6 +123,8 @@ pub fn new_config() -> Config {
         timeout: default_timeout(),
         idle_timeout: default_idle_timeout(),
         liveness_timeout: default_liveness_timeout(),
+        dispatch_freshness: default_dispatch_freshness(),
+        busy_liveness_timeout: default_busy_liveness_timeout(),
         // Explicit-only: 0 (= unset) means "no limit".
         upstream_timeout: 0,
         secret_key: String::new(),
@@ -106,6 +157,33 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     }
     if config.liveness_timeout <= 0 {
         config.liveness_timeout = default_liveness_timeout();
+    }
+    if config.dispatch_freshness <= 0 {
+        config.dispatch_freshness = default_dispatch_freshness();
+    } else if config.dispatch_freshness < MIN_DISPATCH_FRESHNESS_MS {
+        // Below ~1.3x the client's 30s ping cadence a healthy idle tunnel
+        // would be closed between pings — pure churn, the client just
+        // redials it. Degrade to the safe default with a warning.
+        log::log(format!(
+            "dispatchfreshness {}ms is below the minimum {}ms (must exceed the client's 30s \
+             ping cadence with margin); falling back to default {}ms",
+            config.dispatch_freshness,
+            MIN_DISPATCH_FRESHNESS_MS,
+            default_dispatch_freshness()
+        ));
+        config.dispatch_freshness = default_dispatch_freshness();
+    }
+    if config.busy_liveness_timeout <= 0 {
+        config.busy_liveness_timeout = default_busy_liveness_timeout();
+    } else if config.busy_liveness_timeout < MIN_BUSY_LIVENESS_TIMEOUT_MS {
+        log::log(format!(
+            "busylivenesstimeout {}ms is below the minimum {}ms (must exceed the client's 30s \
+             ping cadence with margin); falling back to default {}ms",
+            config.busy_liveness_timeout,
+            MIN_BUSY_LIVENESS_TIMEOUT_MS,
+            default_busy_liveness_timeout()
+        ));
+        config.busy_liveness_timeout = default_busy_liveness_timeout();
     }
     // upstreamtimeout is explicit-only: absent or <= 0 stays "no limit" —
     // nothing is applied that was not configured.
@@ -145,5 +223,70 @@ mod tests {
     fn upstream_timeout_positive_value_is_preserved() {
         let c = load_with("upstreamtimeout: 60000");
         assert_eq!(c.upstream_timeout, 60_000);
+    }
+
+    #[test]
+    fn dispatch_freshness_unset_or_non_positive_falls_back_to_default() {
+        assert_eq!(load_with("").dispatch_freshness, 75_000);
+        assert_eq!(load_with("dispatchfreshness: 0").dispatch_freshness, 75_000);
+        assert_eq!(
+            load_with("dispatchfreshness: -5").dispatch_freshness,
+            75_000
+        );
+    }
+
+    #[test]
+    fn dispatch_freshness_below_floor_falls_back_to_default() {
+        // 30s is below the 40s floor: a healthy idle tunnel would be closed
+        // between the client's 30s pings (pure churn) — degrade to default.
+        assert_eq!(
+            load_with("dispatchfreshness: 30000").dispatch_freshness,
+            75_000
+        );
+    }
+
+    #[test]
+    fn dispatch_freshness_sane_value_is_preserved() {
+        assert_eq!(
+            load_with("dispatchfreshness: 40000").dispatch_freshness,
+            40_000
+        );
+        assert_eq!(
+            load_with("dispatchfreshness: 90000").dispatch_freshness,
+            90_000
+        );
+    }
+
+    #[test]
+    fn busy_liveness_unset_or_non_positive_falls_back_to_default() {
+        assert_eq!(load_with("").busy_liveness_timeout, 600_000);
+        assert_eq!(
+            load_with("busylivenesstimeout: 0").busy_liveness_timeout,
+            600_000
+        );
+        assert_eq!(
+            load_with("busylivenesstimeout: -1").busy_liveness_timeout,
+            600_000
+        );
+    }
+
+    #[test]
+    fn busy_liveness_below_floor_falls_back_to_default() {
+        assert_eq!(
+            load_with("busylivenesstimeout: 5000").busy_liveness_timeout,
+            600_000
+        );
+    }
+
+    #[test]
+    fn busy_liveness_sane_value_is_preserved() {
+        assert_eq!(
+            load_with("busylivenesstimeout: 60000").busy_liveness_timeout,
+            60_000
+        );
+        assert_eq!(
+            load_with("busylivenesstimeout: 900000").busy_liveness_timeout,
+            900_000
+        );
     }
 }

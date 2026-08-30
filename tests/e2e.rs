@@ -748,3 +748,43 @@ fn test_tunnel_id_correlation() {
         );
     }
 }
+
+/// The client's periodic pool health check (`healthcheckinterval`): with the
+/// interval at its 10s floor, a real client must log a health round that
+/// VERIFIES the idle tunnels as ok (the real server answers the probe pings)
+/// and must not have killed them — a proxied request right after the round
+/// still succeeds. This is the integration guard against a probe bug that
+/// would false-reap healthy tunnels and reconnect-churn the pool every round.
+#[test]
+fn test_pool_health_check_verifies_and_keeps_tunnels() {
+    let env = setup(true, "healthcheckinterval: 10000\n");
+    let p = env.srv_port;
+
+    // Wait for the first health round (fires 10s after the client starts).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let health_line;
+    loop {
+        let log = env._client.log();
+        if let Some(line) = log
+            .lines()
+            .rev()
+            .find(|l| l.contains("pool health:") && l.contains("idle"))
+        {
+            health_line = line.to_string();
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("no pool health line within 30s; client log:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        health_line.contains("ok=2"),
+        "both idle tunnels must be verified ok, got: {health_line}"
+    );
+
+    // The verified tunnels must still serve traffic.
+    let resp = proxy_request(p, reqwest::Method::GET, "/hello", None, &[]);
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().unwrap().trim_end(), "hello world");
+}

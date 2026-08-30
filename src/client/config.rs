@@ -1,22 +1,18 @@
 //! Client configuration.
 
-use crate::client::connection::PING_INTERVAL_MS;
+use crate::client::connection::PROBE_DEADLINE;
 use crate::common::Rule;
 use crate::log;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Minimum sane `livenesstimeout` (ms), derived from the keepalive ping
-/// interval (`PING_INTERVAL_MS` in `connection.rs` — change them together).
-/// The client judges liveness by pong arrival, and pongs only come in
-/// response to the keepalive ping (the server never pongs proactively). A
-/// timeout below ~2x the ping interval cannot reliably observe two pongs, so
-/// on a healthy idle link the gap between pongs (~30s) would already exceed
-/// it and the reaper would false-reap live connections — draining and
-/// churning the whole pool. Any configured value below this floor falls back
-/// to the default (and logs a warning), so a too-small value degrades to
-/// "safe" instead of "broken".
-const MIN_LIVENESS_TIMEOUT_MS: i64 = 2 * PING_INTERVAL_MS;
+/// Minimum sane `healthcheckinterval` (ms): a health round probes every idle
+/// tunnel and waits up to the probe deadline (`PROBE_DEADLINE`, 10s) for the
+/// pong, so an interval below the deadline cannot finish a round before the
+/// next one is due — it would just chain rounds back-to-back. Below the
+/// floor the value falls back to the default (with a warning), mirroring
+/// `livenesstimeout`.
+const MIN_HEALTH_CHECK_INTERVAL_MS: i64 = PROBE_DEADLINE.as_millis() as i64;
 
 /// Configures a WSP client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -29,20 +25,41 @@ pub struct Config {
     pub pool_idle_size: i64,
     #[serde(rename = "poolmaxsize", default = "default_pool_max_size")]
     pub pool_max_size: i64,
-    /// Liveness timeout: an idle tunnel that has received no frame at all
-    /// (pong/data) from the server for longer than this is considered
-    /// half-open (the peer or the path is gone) and is closed so the pool
-    /// connector dials a replacement. The client sends a ping every 30s, so
-    /// on a live link a pong arrives ~every 30s. The default (90s = 3 ping
-    /// periods) tolerates a couple of missed pongs while still reaping dead
-    /// links well before the server's `livenesstimeout` (default 120s), so
-    /// the client reconnects proactively and the pool stays warm overnight.
-    /// Sending pings without verifying pongs cannot detect dead links, so
-    /// without this the client would hold a pool of dead connections and the
-    /// server would report "no proxy available" after an idle night.
+    /// Wedge backstop (ms): normal dead-link detection is the ACTIVE
+    /// health-round probe (`healthcheckinterval` cadence, ping -> pong
+    /// within its own 10s deadline) — but a tunnel whose write queue is too
+    /// full to even send the probe ping cannot be probed. If such a tunnel
+    /// has also received no frame at all for longer than this, it is
+    /// declared dead (a live driver drains the queue within ~RTT; a
+    /// permanently-full queue plus a silent link is a wedged tunnel).
+    /// Historical note: this used to be the passive per-connection reaper's
+    /// threshold, enforced with a ~2x-ping-interval floor to avoid
+    /// false-reaping between pongs; the probe made that floor unnecessary,
+    /// so any positive value is now the operator's call. (Caveat: the wedge
+    /// branch still inherits the old floor's false-positive mode — right
+    /// after a streamed response the queue can be momentarily full while the
+    /// last pong is already old, so a value below ~2x the ping cadence can
+    /// close a healthy tunnel in that narrow window; the default, 3
+    /// cadences, keeps it negligible.)
     /// `0` falls back to the default.
     #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
     pub liveness_timeout: i64,
+    /// Pool health-check interval (ms): how often the client runs a health
+    /// round — actively probe every idle tunnel (ping → pong), close the
+    /// unresponsive ones, print each tunnel's status, and refill the pool to
+    /// `poolidlesize` immediately. This is what guarantees the SERVER always
+    /// has usable tunnels: the passive liveness reaper needs up to
+    /// `livenesstimeout` to notice a dead link, and while a half-open tunnel
+    /// still LOOKS idle the demand-driven connector dials nothing — during
+    /// that window the server has no usable connection and requests fail
+    /// until the client is restarted. Must exceed the 10s probe deadline;
+    /// below the floor it falls back to the default and logs a warning.
+    /// `0` falls back to the default.
+    #[serde(
+        rename = "healthcheckinterval",
+        default = "default_health_check_interval"
+    )]
+    pub health_check_interval: i64,
     /// Upstream connect timeout (ms): bounds DNS + TCP + TLS for dialing a
     /// route's upstream. Caps the damage of a blackholed address (dropped
     /// SYNs would otherwise stall the request for the OS retransmit ladder).
@@ -123,6 +140,9 @@ fn default_pool_max_size() -> i64 {
 fn default_liveness_timeout() -> i64 {
     90000
 }
+fn default_health_check_interval() -> i64 {
+    30000
+}
 
 /// Create a new client config with default values (including a fresh UUID).
 pub fn new_config() -> Config {
@@ -132,6 +152,7 @@ pub fn new_config() -> Config {
         pool_idle_size: default_pool_idle_size(),
         pool_max_size: default_pool_max_size(),
         liveness_timeout: default_liveness_timeout(),
+        health_check_interval: default_health_check_interval(),
         // Timeouts are explicit-only: 0 (= unset) means "no limit". Nothing
         // is applied that the operator did not configure.
         connect_timeout: 0,
@@ -167,27 +188,27 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.pool_max_size <= 0 {
         config.pool_max_size = default_pool_max_size();
     }
-    // Treat a non-positive duration as "unset" -> use the default. A bare
-    // `== 0` check would let a negative value through and immediately reap
-    // every idle connection on the first keepalive pass (`elapsed` is always
-    // >= 0 > a negative threshold), silently killing the whole pool.
+    // Treat a non-positive duration as "unset" -> use the default (a bare
+    // `== 0` check would let a negative value through and turn the probe's
+    // wedge backstop into an always-dead verdict).
     if config.liveness_timeout <= 0 {
         config.liveness_timeout = default_liveness_timeout();
-    } else if config.liveness_timeout < MIN_LIVENESS_TIMEOUT_MS {
-        // The client judges liveness by pong arrival, and pongs only come in
-        // response to the 30s ping; a timeout below ~2x the ping interval
-        // cannot reliably see two pongs and would false-reap healthy links,
-        // churning the pool. Clamp to the default and warn so the operator
-        // knows their value was overridden.
+    }
+    // Same treatment for the health-check cadence: non-positive = "unset" ->
+    // default; a value below the probe deadline cannot complete a round
+    // before the next is due, so it also falls back (with a warning).
+    if config.health_check_interval <= 0 {
+        config.health_check_interval = default_health_check_interval();
+    } else if config.health_check_interval < MIN_HEALTH_CHECK_INTERVAL_MS {
         log::log(format!(
-            "livenesstimeout {}ms is below the minimum {}ms (must exceed ~2x the {}ms ping \
-             interval: pongs only arrive in response to a ping); falling back to default {}ms",
-            config.liveness_timeout,
-            MIN_LIVENESS_TIMEOUT_MS,
-            PING_INTERVAL_MS,
-            default_liveness_timeout()
+            "healthcheckinterval {}ms is below the minimum {}ms (a health round waits up to \
+             the {}ms probe deadline for every idle tunnel's pong); falling back to default {}ms",
+            config.health_check_interval,
+            MIN_HEALTH_CHECK_INTERVAL_MS,
+            MIN_HEALTH_CHECK_INTERVAL_MS,
+            default_health_check_interval()
         ));
-        config.liveness_timeout = default_liveness_timeout();
+        config.health_check_interval = default_health_check_interval();
     }
     // Timeouts (connecttimeout / upstreamtimeout / tunneltimeout /
     // streamidletimeout / upstreamidletimeout) are explicit-only: absent or
@@ -215,11 +236,12 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
 
 #[cfg(test)]
 mod tests {
-    //! The client judges liveness by pong arrival, and pongs only come in
-    //! response to the 30s ping — so a `livenesstimeout` below ~2x the ping
-    //! interval would false-reap healthy links and churn the pool. These
-    //! tests pin the load-time floor: too-small / unset / negative values
-    //! all fall back to the safe default, while a sane value is preserved.
+    //! Dead-link detection is the active health-round probe (ping → pong
+    //! within its own deadline); `livenesstimeout` is only the staleness
+    //! backstop for tunnels that cannot be probed at all (wedged write
+    //! queue). Unset / non-positive falls back to the default; any positive
+    //! value is the operator's call (there is no ping-cadence floor to
+    //! enforce anymore — the probe has its own deadline).
 
     use super::*;
 
@@ -238,26 +260,22 @@ mod tests {
     }
 
     #[test]
-    fn liveness_below_minimum_falls_back_to_default() {
-        // 5s is below the 60s floor (cannot see two 30s pings) -> default.
-        let c = load_with("livenesstimeout: 5000");
-        assert_eq!(c.liveness_timeout, default_liveness_timeout());
-    }
-
-    #[test]
     fn liveness_unset_or_non_positive_falls_back_to_default() {
-        // Explicit 0 and negative both -> default (no underflow reap).
+        // Explicit 0 and negative both -> default.
         let c = load_with("livenesstimeout: 0");
         assert_eq!(c.liveness_timeout, default_liveness_timeout());
         let c = load_with("livenesstimeout: -1");
         assert_eq!(c.liveness_timeout, default_liveness_timeout());
     }
 
+    /// Since detection became the active probe, `livenesstimeout` is only the
+    /// staleness backstop for tunnels that cannot be probed (wedge case) —
+    /// there is no ping-cadence floor anymore, so any positive value is the
+    /// operator's call and is preserved as-is.
     #[test]
-    fn liveness_at_or_above_minimum_is_preserved() {
-        // Exactly the floor and a large value are kept as-is.
-        let c = load_with(&format!("livenesstimeout: {MIN_LIVENESS_TIMEOUT_MS}"));
-        assert_eq!(c.liveness_timeout, MIN_LIVENESS_TIMEOUT_MS);
+    fn liveness_any_positive_value_is_preserved() {
+        let c = load_with("livenesstimeout: 5000");
+        assert_eq!(c.liveness_timeout, 5000);
         let c = load_with("livenesstimeout: 120000");
         assert_eq!(c.liveness_timeout, 120_000);
     }
@@ -304,6 +322,37 @@ mod tests {
         assert_eq!(c.pool_idle_size, default_pool_idle_size());
         let c = load_with("poolmaxsize: -1");
         assert_eq!(c.pool_max_size, default_pool_max_size());
+    }
+
+    /// `healthcheckinterval` (client): cadence of the periodic pool health
+    /// round. Unset/0/negative -> default; below the 10s floor (a round
+    /// cannot meaningfully run faster than its own probe deadline) -> the
+    /// default too, with a warning; at/above the floor preserved as-is.
+    #[test]
+    fn health_check_interval_defaults_floor_and_preservation() {
+        let d = default_health_check_interval();
+        // Unset / 0 / negative -> default.
+        assert_eq!(load_with("").health_check_interval, d);
+        assert_eq!(load_with("healthcheckinterval: 0").health_check_interval, d);
+        assert_eq!(
+            load_with("healthcheckinterval: -1").health_check_interval,
+            d
+        );
+        // Below the floor -> default (probing faster than the probe deadline
+        // would just chain rounds back-to-back).
+        assert_eq!(
+            load_with("healthcheckinterval: 5000").health_check_interval,
+            d
+        );
+        // At the floor and above -> preserved.
+        assert_eq!(
+            load_with("healthcheckinterval: 10000").health_check_interval,
+            10_000
+        );
+        assert_eq!(
+            load_with("healthcheckinterval: 60000").health_check_interval,
+            60_000
+        );
     }
 
     #[test]

@@ -37,6 +37,11 @@ type Boxed = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 struct ConnRequest {
     tx: oneshot::Sender<Option<Arc<Connection>>>,
     deadline: Instant,
+    /// Dispatch freshness budget (`dispatchfreshness` config): an idle
+    /// tunnel whose last received frame is older than this is closed instead
+    /// of being handed to the request — it is half-open even if its status
+    /// still says Idle.
+    fresh_for: Duration,
 }
 
 /// The shared server state.
@@ -195,7 +200,7 @@ async fn dispatch_loop(
     mut idle_rx: mpsc::Receiver<Arc<Connection>>,
 ) {
     while let Some(req) = req_rx.recv().await {
-        let conn = acquire(&mut idle_rx, req.deadline).await;
+        let conn = acquire(&mut idle_rx, req.deadline, req.fresh_for).await;
         let _ = req.tx.send(conn);
     }
 }
@@ -203,6 +208,7 @@ async fn dispatch_loop(
 async fn acquire(
     idle_rx: &mut mpsc::Receiver<Arc<Connection>>,
     deadline: Instant,
+    fresh_for: Duration,
 ) -> Option<Arc<Connection>> {
     loop {
         let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -213,11 +219,32 @@ async fn acquire(
             Err(_) => return None,   // timed out
             Ok(None) => return None, // no idle senders (no proxies)
             Ok(Some(conn)) => {
-                if conn.take() {
-                    return Some(conn);
+                if !conn.take() {
+                    // Stale connection; try again within the remaining time.
+                    continue;
                 }
-                // Stale connection; try again within the remaining time.
-                continue;
+                // Freshness filter: the client pings every 30s, so a healthy
+                // idle tunnel's watermark is never much older than one ping
+                // interval. A stale one is half-open even though its status
+                // still said Idle (the client has not noticed the break
+                // yet) — handing the request to it would send the request
+                // into the void. Close it (the take() first guarantees we
+                // own it, so no in-flight request can be hurt) and try the
+                // next one.
+                let silent = conn.last_activity().elapsed();
+                if silent > fresh_for {
+                    log::log(format!(
+                        "Not dispatching tunnel#{} from {}: no frame for {}ms (stale > {}ms); \
+                         closing and trying the next tunnel",
+                        conn.id,
+                        conn.pool_id,
+                        silent.as_millis(),
+                        fresh_for.as_millis()
+                    ));
+                    conn.close();
+                    continue;
+                }
+                return Some(conn);
             }
         }
     }
@@ -401,9 +428,14 @@ async fn handle_request(
     // Acquire an idle proxy connection.
     let (tx, rx) = oneshot::channel();
     let deadline = Instant::now() + Duration::from_millis(inner.config.timeout as u64);
+    let fresh_for = Duration::from_millis(inner.config.dispatch_freshness.max(0) as u64);
     if inner
         .req_tx
-        .send(ConnRequest { tx, deadline })
+        .send(ConnRequest {
+            tx,
+            deadline,
+            fresh_for,
+        })
         .await
         .is_err()
     {
@@ -638,6 +670,7 @@ where
                     inner.idle_tx.clone(),
                     inner.config.idle_timeout,
                     inner.config.liveness_timeout,
+                    inner.config.busy_liveness_timeout,
                 );
                 pools.push(p.clone());
                 p
@@ -646,4 +679,66 @@ where
     };
     pool.set_size(size);
     pool.register(ws, conn_id);
+}
+
+#[cfg(test)]
+mod tests {
+    //! The dispatcher's freshness filter (`dispatchfreshness`): the client
+    //! pings every 30s, so a healthy idle tunnel's watermark is never much
+    //! older than one ping interval. An idle tunnel OLDER than the budget
+    //! is half-open even though its status still says Idle (the client has
+    //! not noticed the break yet); dispatching a request to it would send
+    //! the request into the void. The filter closes such tunnels and moves
+    //! to the next one.
+
+    use super::*;
+    use crate::server::connection::{dummy_connection, Status};
+
+    /// A stale idle tunnel is closed instead of being dispatched; the next
+    /// (fresh) tunnel in the queue serves the request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acquire_skips_and_closes_stale_idle_tunnel() {
+        let (idle_tx, mut idle_rx) = mpsc::channel(8);
+        let (stale, _p1) = dummy_connection(1, idle_tx.clone()).await;
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .unwrap_or_else(Instant::now);
+        stale.set_last_activity(long_ago);
+        let (fresh, _p2) = dummy_connection(2, idle_tx.clone()).await;
+        idle_tx.send(stale.clone()).await.unwrap();
+        idle_tx.send(fresh.clone()).await.unwrap();
+
+        let got = acquire(
+            &mut idle_rx,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(75_000),
+        )
+        .await
+        .expect("a fresh tunnel must be dispatched");
+
+        assert!(
+            Arc::ptr_eq(&got, &fresh),
+            "the stale tunnel must be skipped in favor of the fresh one"
+        );
+        assert!(stale.is_closed(), "the stale tunnel must be closed");
+        assert_eq!(got.status(), Status::Busy, "a dispatched tunnel is taken");
+    }
+
+    /// A fresh idle tunnel is dispatched with no freshness overhead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acquire_dispatches_fresh_tunnel() {
+        let (idle_tx, mut idle_rx) = mpsc::channel(8);
+        let (conn, _peer) = dummy_connection(1, idle_tx.clone()).await;
+        idle_tx.send(conn.clone()).await.unwrap();
+
+        let got = acquire(
+            &mut idle_rx,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(75_000),
+        )
+        .await
+        .expect("a fresh tunnel must be dispatched");
+        assert!(Arc::ptr_eq(&got, &conn));
+        assert_eq!(got.status(), Status::Busy);
+    }
 }
