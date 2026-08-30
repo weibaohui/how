@@ -180,9 +180,11 @@ rely on detecting it:
   has received nothing for this long — the last-resort bound for a
   bidirectionally partitioned link, where the client's close can never
   arrive and a request with no `upstreamtimeout` would otherwise hang
-  forever (a busy tunnel serving traffic constantly receives frames; keep
-  the value above your longest legitimate silent phase: slow upload, hung
-  upstream, SSE gaps).
+  forever. On a live link the client's 30 s pings keep that watermark fresh
+  in *every* request phase (uploads, waiting on upstream headers, SSE gaps
+  all included), so the fuse only fires when pings stop arriving at all:
+  the link is dead, the client is wedged, or the path is fully backlogged
+  (e.g. a caller that stopped reading the response).
 - **Client side** (the periodic pool health round, `healthcheckinterval`
   default 30 s — see below): the client actively PROBES every idle tunnel
   (ping → wait for the pong, 10 s deadline) and closes the ones that do not

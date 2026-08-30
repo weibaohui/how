@@ -40,12 +40,13 @@ pub struct Config {
     /// frame at all for longer than this is closed. This is the last-resort
     /// fuse for a bidirectionally partitioned link: the client's close
     /// cannot reach the server either, and without `upstreamtimeout` the
-    /// proxied request would otherwise hang forever. A busy connection
-    /// actively serving traffic constantly receives frames (a streamed
-    /// response keeps it fresh); only genuinely silent phases age it — a
-    /// huge slow upload, waiting on a hung upstream, or an SSE stream with
-    /// long gaps between events. Set it above your longest legitimate
-    /// silent phase. `0` falls back to the default (600s); a value below
+    /// proxied request would otherwise hang forever. On a LIVE link the
+    /// client's 30s keepalive pings keep this watermark fresh in EVERY
+    /// request phase (uploads, waiting on upstream headers, SSE gaps all
+    /// included), so the fuse only fires when pings stop arriving at all:
+    /// the link is dead, the client is wedged, or the path is fully
+    /// backlogged (e.g. a caller that stopped reading the response).
+    /// `0` falls back to the default (600s); a value below
     /// 60s falls back to the default with a warning.
     #[serde(
         rename = "busylivenesstimeout",
@@ -109,9 +110,9 @@ fn default_busy_liveness_timeout() -> i64 {
 /// healthy idle tunnel would be closed between pings (pure churn — the
 /// client would redial it every time). Falls back to the default instead.
 const MIN_DISPATCH_FRESHNESS_MS: i64 = 40000;
-/// Floor for `busylivenesstimeout`: a busy connection only receives frames
-/// while traffic flows; a tiny value would kill requests in their legitimate
-/// silent phases (waiting on upstream headers, slow uploads, SSE gaps).
+/// Floor for `busylivenesstimeout`: the client's 30s keepalive pings refresh
+/// a busy connection's watermark on any live link, so a value below ~2x that
+/// cadence could false-fire on nothing worse than scheduling jitter.
 const MIN_BUSY_LIVENESS_TIMEOUT_MS: i64 = 60000;
 
 /// Create a new Server config with default values.
@@ -176,9 +177,8 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
         config.busy_liveness_timeout = default_busy_liveness_timeout();
     } else if config.busy_liveness_timeout < MIN_BUSY_LIVENESS_TIMEOUT_MS {
         log::log(format!(
-            "busylivenesstimeout {}ms is below the minimum {}ms (a busy connection is silent \
-             during legitimate phases like waiting on upstream headers); falling back to \
-             default {}ms",
+            "busylivenesstimeout {}ms is below the minimum {}ms (must exceed the client's 30s \
+             ping cadence with margin); falling back to default {}ms",
             config.busy_liveness_timeout,
             MIN_BUSY_LIVENESS_TIMEOUT_MS,
             default_busy_liveness_timeout()

@@ -77,15 +77,17 @@ impl Pool {
             .filter_map(|connection| {
                 let st = connection.status();
                 if st == Status::Busy {
-                    // Busy fuse: a busy connection serving traffic constantly
-                    // RECEIVES frames (a streamed response keeps the
-                    // watermark fresh). One that has received nothing for
-                    // longer than the busy liveness timeout is stuck in a
-                    // silent phase — legitimately (slow upload, hung
-                    // upstream, SSE gaps) or not (bidirectional partition,
-                    // where the client's close can never arrive). Past the
-                    // operator-chosen budget, close it: the hanging request
-                    // fails fast instead of forever, and the slot frees up.
+                    // Busy fuse: on a live link the client's 30s keepalive
+                    // pings keep this watermark fresh in EVERY request phase
+                    // (uploads, waiting on upstream headers, SSE gaps). One
+                    // that has received nothing for longer than the busy
+                    // liveness timeout is therefore not in a "silent phase" —
+                    // the link is dead (bidirectional partition, where the
+                    // client's close can never arrive), the client is wedged,
+                    // or the path is fully backlogged (a caller that stopped
+                    // reading). Past the operator-chosen budget, close it:
+                    // the hanging request fails fast instead of forever, and
+                    // the slot frees up.
                     let silent_ms = connection.last_activity().elapsed().as_millis() as i64;
                     if silent_ms > self.busy_liveness_timeout_ms {
                         log::log(format!(
@@ -181,13 +183,14 @@ impl Pool {
 
 #[cfg(test)]
 mod tests {
-    //! The cleaner's Busy-connection fuse: a busy connection actively
-    //! serving traffic constantly receives frames, so one that has received
-    //! NOTHING for longer than `busylivenesstimeout` is stuck (at best a
-    //! hung upstream, at worst a bidirectional partition where the client's
-    //! close can never arrive) and must be closed — otherwise a proxied
-    //! request with no `upstreamtimeout` hangs forever. Idle-connection
-    //! behavior must stay untouched by the fuse.
+    //! The cleaner's Busy-connection fuse: on a live link the client's 30s
+    //! keepalive pings keep a busy connection's watermark fresh in every
+    //! request phase, so one that has received NOTHING for longer than
+    //! `busylivenesstimeout` means the link or the client is gone (at worst
+    //! a bidirectional partition where the client's close can never arrive)
+    //! and must be closed — otherwise a proxied request with no
+    //! `upstreamtimeout` hangs forever. Idle-connection behavior must stay
+    //! untouched by the fuse.
 
     use super::*;
     use crate::server::connection::dummy_connection;
@@ -250,8 +253,8 @@ mod tests {
         assert_eq!(conn.status(), Status::Busy);
     }
 
-    /// A busy connection silent BELOW the fuse (a legitimate silent phase —
-    /// waiting on upstream headers) must survive.
+    /// A busy connection silent BELOW the fuse (still within one ping
+    /// cadence of margin) must survive.
     #[tokio::test(flavor = "current_thread")]
     async fn cleaner_keeps_busy_connection_below_the_fuse() {
         let (idle_tx, _idle_rx) = mpsc::channel(8);
@@ -266,7 +269,7 @@ mod tests {
 
         assert!(
             !pool.is_empty(),
-            "a busy connection in a legitimate silent phase must survive"
+            "a busy connection below the fuse must survive"
         );
         assert_eq!(conn.status(), Status::Busy);
     }
