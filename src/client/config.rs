@@ -35,7 +35,12 @@ pub struct Config {
     /// Historical note: this used to be the passive per-connection reaper's
     /// threshold, enforced with a ~2x-ping-interval floor to avoid
     /// false-reaping between pongs; the probe made that floor unnecessary,
-    /// so any positive value is now the operator's call.
+    /// so any positive value is now the operator's call. (Caveat: the wedge
+    /// branch still inherits the old floor's false-positive mode — right
+    /// after a streamed response the queue can be momentarily full while the
+    /// last pong is already old, so a value below ~2x the ping cadence can
+    /// close a healthy tunnel in that narrow window; the default, 3
+    /// cadences, keeps it negligible.)
     /// `0` falls back to the default.
     #[serde(rename = "livenesstimeout", default = "default_liveness_timeout")]
     pub liveness_timeout: i64,
