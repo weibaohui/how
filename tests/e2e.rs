@@ -762,7 +762,7 @@ fn test_pool_health_check_verifies_and_keeps_tunnels() {
 
     // Wait for the first health round (fires 10s after the client starts).
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut health_line = String::new();
+    let health_line;
     loop {
         let log = env._client.log();
         if let Some(line) = log

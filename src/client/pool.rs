@@ -1,6 +1,8 @@
 //! Client-side connection pool to a single WSP server target.
 
-use crate::client::connection::{Connection, ProbeOutcome, Status, PROBE_DEADLINE};
+use crate::client::connection::{
+    Connection, ProbeOutcome, Status, PROBE_DEADLINE, RUNNING_STALE_FLOOR,
+};
 use crate::client::{ClientConfig, ClientInner};
 use crate::log;
 use futures::future::join_all;
@@ -10,6 +12,40 @@ use tokio_util::sync::CancellationToken;
 
 /// Cap for the connector's exponential failure backoff (2, 4, 8, 16, 32, 60s).
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Run `f` in an isolated task so a panic inside it cannot kill the calling
+/// loop (tokio aborts only the panicking child). The caller is told via
+/// `JoinError` but keeps ticking.
+async fn panic_safe<F>(label: &str, f: F) -> Result<(), tokio::task::JoinError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(f).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::log(format!("{label} panicked ({e}); continuing next interval"));
+            Err(e)
+        }
+    }
+}
+
+/// How long a Connecting tunnel may live before the health round reaps it.
+/// With `tunneltimeout` set, the three sequential dial phases (TCP connect,
+/// websocket handshake, greeting) are each bounded by it, so a legitimate
+/// connect always completes within 3x the budget (+ scheduling margin).
+/// Unset means "no per-phase limit" — but NOT "no limit forever": a fixed
+/// 60s cap keeps a peer that accepts TCP and then goes silent from leaking
+/// pool capacity indefinitely (the Connecting-zombie case).
+fn connecting_reap_after(config: &ClientConfig) -> Duration {
+    if config.tunnel_timeout > 0 {
+        let ms = (config.tunnel_timeout as u64)
+            .saturating_mul(3)
+            .saturating_add(10_000);
+        Duration::from_millis(ms)
+    } else {
+        Duration::from_secs(60)
+    }
+}
 
 /// Pool manage a pool of connection to a remote Server.
 pub struct Pool {
@@ -148,7 +184,15 @@ impl Pool {
                     tokio::select! {
                         _ = this.done.cancelled() => break,
                         _ = tokio::time::sleep(interval) => {
-                            this.health_round(PROBE_DEADLINE).await;
+                            // Panic isolation: with the per-connection passive
+                            // reaper gone, the health round is the ONLY
+                            // dead-tunnel detection. A panic must not silently
+                            // kill this loop for the whole pool.
+                            let round = this.clone();
+                            let _ = panic_safe("pool health round", async move {
+                                round.health_round(PROBE_DEADLINE).await;
+                            })
+                            .await;
                         }
                     }
                 }
@@ -185,40 +229,103 @@ impl Pool {
     /// One periodic health pass over the pool (run by the health loop spawned
     /// in `start`, every `healthcheckinterval`):
     ///
-    /// 1. Actively probe every Idle tunnel (ping + wait for the pong within
+    /// 1. Reap stale CONNECTING tunnels by age (a dial that never completes
+    ///    would hold pool capacity forever when `tunneltimeout` is unset).
+    /// 2. Reap wedged RUNNING tunnels via the dual-watermark check (a
+    ///    healthy Running tunnel always makes progress in at least one
+    ///    direction — reads, writes, or the keepalive ping getting out;
+    ///    both stale = the driver is wedged on a half-open link).
+    /// 3. Actively probe every Idle tunnel (ping + wait for the pong within
     ///    `probe_deadline`) — concurrently, so the round takes ~RTT, not
-    ///    tunnels × RTT.
-    /// 2. Close and remove the tunnels that do not answer, and print each
-    ///    tunnel's status (verdict + pong age) — a wedged pool is then visible
-    ///    in the log instead of silently showing "10 idle".
-    /// 3. Dial the deficit to the target total so the pool always holds
+    ///    tunnels × RTT. Close and remove the tunnels that do not answer,
+    ///    and print each tunnel's status (verdict + pong age) — a wedged
+    ///    pool is then visible in the log instead of silently showing
+    ///    "10 idle".
+    /// 4. Dial the deficit to the target total so the pool always holds
     ///    `pool_idle_size` VERIFIED-available tunnels (see the note at the
     ///    dial site for why this is not delegated to the demand-driven
     ///    connector).
     ///
-    /// Running/Connecting tunnels are not probed (Running is demonstrably
-    /// exchanging data, see `Connection::probe`). The pool log line prints
-    /// every round — the "is my pool actually alive" heartbeat — while dead
-    /// tunnels get their own actionable line.
+    /// The pool log line prints every round — the "is my pool actually
+    /// alive" heartbeat — while reaped tunnels get their own actionable
+    /// lines.
     pub(crate) async fn health_round(&self, probe_deadline: Duration) {
         // Snapshot under the lock, probe without it (probes sleep for up to
         // `probe_deadline` and must not hold the pool hostage).
         let mut idle_conns: Vec<Arc<Connection>> = Vec::new();
-        let (mut connecting, mut running) = (0usize, 0usize);
+        let mut running_conns: Vec<Arc<Connection>> = Vec::new();
+        let mut connecting_conns: Vec<Arc<Connection>> = Vec::new();
         {
             let conns = self.connections.lock().unwrap();
             for conn in conns.iter() {
                 match conn.status() {
                     Status::Idle => idle_conns.push(conn.clone()),
-                    Status::Connecting => connecting += 1,
-                    Status::Running => running += 1,
+                    Status::Connecting => connecting_conns.push(conn.clone()),
+                    Status::Running => running_conns.push(conn.clone()),
                     Status::Closed => {}
                 }
             }
         }
         let started = Instant::now();
+        // Wedge backstop: `livenesstimeout` is now only the staleness
+        // threshold for tunnels whose write queue is too full to be probed
+        // (see `Connection::probe`).
+        let stale_after = Duration::from_millis(self.client.config.liveness_timeout.max(0) as u64);
+
+        // (1) Connecting-age reap. shutdown() scores the tunnel a failure
+        // (never usable), feeding the connector backoff — exactly right: a
+        // server that never completes registrations IS failing. The reaped
+        // entry frees its pool slot; `connect()` races the cancel token in
+        // every dial phase, so the wedged dial task unwinds instead of
+        // leaking.
+        let connecting_reap = connecting_reap_after(&self.client.config);
+        let mut connecting = 0usize;
+        let mut reaped_connecting = 0usize;
+        for conn in connecting_conns {
+            if conn.created_at().elapsed() > connecting_reap {
+                reaped_connecting += 1;
+                log::log(format!(
+                    "pool health: tunnel#{} STUCK-CONNECTING for {}s (budget {}s); closing",
+                    conn.id(),
+                    conn.created_at().elapsed().as_secs(),
+                    connecting_reap.as_secs()
+                ));
+                conn.shutdown();
+            } else {
+                connecting += 1;
+            }
+        }
+
+        // (2) Running dual-watermark reap. The threshold is clamped up to
+        // RUNNING_STALE_FLOOR: a healthy Running tunnel silently waiting
+        // for upstream first bytes only SENDS at the 30s keepalive cadence,
+        // so its write watermark legitimately ages up to one ping interval
+        // — a lower threshold would false-reap healthy waiting tunnels.
+        let running_stale = stale_after.max(RUNNING_STALE_FLOOR);
+        let mut running = 0usize;
+        let mut reaped_running = 0usize;
+        for conn in running_conns {
+            let silent = conn.last_activity().elapsed();
+            let unsent = conn.last_write().elapsed();
+            if silent > running_stale && unsent > running_stale {
+                reaped_running += 1;
+                log::log(format!(
+                    "pool health: tunnel#{} WEDGED-RUNNING — no frame received for {}s, none \
+                     sent for {}s (threshold {}s); closing",
+                    conn.id(),
+                    silent.as_secs(),
+                    unsent.as_secs(),
+                    running_stale.as_secs()
+                ));
+                conn.shutdown();
+            } else {
+                running += 1;
+            }
+        }
+
+        // (3) Probe the idle tunnels.
         let outcomes = join_all(idle_conns.iter().map(|conn| async move {
-            (conn.clone(), conn.probe(probe_deadline).await)
+            (conn.clone(), conn.probe(probe_deadline, stale_after).await)
         }))
         .await;
 
@@ -260,19 +367,20 @@ impl Pool {
             .min(self.client.config.pool_max_size.max(0) as usize);
         log::log(format!(
             "pool health: idle={} ok={ok} dead={dead} skipped={skipped} connecting={connecting} \
-             running={running} target={target} |{} |round {}ms",
+             running={running} reaped_connecting={reaped_connecting} \
+             reaped_running={reaped_running} target={target} |{} |round {}ms",
             ok + dead + skipped,
             status_line.trim_start(),
             started.elapsed().as_millis()
         ));
-        // Enforce the minimum AVAILABLE tunnel count here instead of
+        // (4) Enforce the minimum AVAILABLE tunnel count here instead of
         // delegating to the demand-driven connector: by design the connector
         // never dials while ANY idle tunnel exists, so without this the pool
         // would drift down one tunnel at a time as they die and only refill
         // at zero — the "server has no connection" window this task exists
         // to close. Available = verified-ok idle + skipped (not confirmed
-        // dead; the passive reaper still watches them) + connecting +
-        // running (busy tunnels return to idle).
+        // dead; the `stale_after` backstop bounds them) + live connecting +
+        // live running (busy tunnels return to idle).
         let available = ok + skipped + connecting + running;
         let deficit = target.saturating_sub(available);
         if deficit == 0 {
@@ -657,7 +765,11 @@ mod tests {
     /// death scores "stable" and does not engage the dial backoff — mirrors
     /// production, where a health-killed tunnel has usually lived for hours).
     /// Without a wired probe writer it still fails the probe (Dead).
-    fn seed_established_idle(pool: &Arc<Pool>, n: usize, with_writer: bool) -> Vec<Arc<Connection>> {
+    fn seed_established_idle(
+        pool: &Arc<Pool>,
+        n: usize,
+        with_writer: bool,
+    ) -> Vec<Arc<Connection>> {
         use tokio_tungstenite::tungstenite::protocol::Message;
 
         let mut seeded = Vec::new();
@@ -737,6 +849,57 @@ mod tests {
         assert_eq!(conns.len(), 10);
     }
 
+    /// The wedge backstop end-to-end through a health round: an idle tunnel
+    /// whose write queue is full (cannot be probed) AND that has been silent
+    /// for longer than `livenesstimeout` is closed and replaced — the one
+    /// case the removed per-connection passive reaper uniquely covered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_kills_wedged_tunnel_with_full_queue_and_stale_activity() {
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        let pool = dummy_pool();
+        let conn = Connection::new(Arc::downgrade(&pool));
+        conn.set_status(Status::Idle);
+        let long_alive = Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .unwrap_or_else(Instant::now);
+        conn.set_connected_at(Some(long_alive));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1); // never drained
+        *conn.probe_tx.lock().unwrap() = Some(tx.clone());
+        tx.try_send(Message::text("fill")).unwrap(); // queue full
+        conn.set_last_activity(long_alive); // silent ever since
+        pool.connections.lock().unwrap().push(conn.clone());
+
+        pool.health_round(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            conn.status(),
+            Status::Closed,
+            "a wedged tunnel (full queue + silent) must be closed by the round"
+        );
+        let conns = pool.connections.lock().unwrap();
+        assert_eq!(
+            conns.len(),
+            10,
+            "0 available -> deficit dialed back to the target total"
+        );
+    }
+
+    /// A panic inside a health round must not kill the health loop: with the
+    /// passive reaper gone, the round is the ONLY dead-tunnel detection, so
+    /// every round runs in an isolated child task (tokio aborts just the
+    /// panicking child) and the loop keeps ticking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn panic_safe_task_isolates_panics() {
+        let boom = panic_safe("test round", async { panic!("boom") });
+        assert!(
+            boom.await.is_err(),
+            "a panicking round must surface a JoinError to the loop, not abort it"
+        );
+        let fine = panic_safe("test round", async {});
+        assert!(fine.await.is_ok());
+    }
+
     /// While in dial backoff with an EMPTY pool (the server was down and has
     /// just come back), the health round still dials exactly ONE rescue
     /// tunnel: the exponential backoff (up to 60s) rightly throttles the 1s
@@ -798,5 +961,138 @@ mod tests {
             "deficit vs the 10-tunnel target with 2 available = 8 dialed"
         );
         assert_eq!(conns.len(), 10, "total restored to the idle-size target");
+    }
+
+    // ------------------------------------------------------------------
+    // Health round: Running dual-watermark reap and Connecting-age reap.
+    // Probes only cover Idle tunnels; these two checks close the remaining
+    // "no usable tunnel, nothing dialed" holes — a tunnel wedged
+    // mid-request on a half-open link, and a dial that never completes.
+    // ------------------------------------------------------------------
+
+    /// A Running tunnel with BOTH watermarks stale (no frame received, none
+    /// successfully sent) is wedged on a half-open link: the health round
+    /// closes it and dials the deficit. The DUAL watermark is the point —
+    /// a Running tunnel streaming a response legitimately receives nothing
+    /// for minutes, so silence alone must never convict; the write
+    /// watermark is what separates "streaming" from "wedged".
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_reaps_wedged_running_tunnel() {
+        let pool = dummy_pool();
+        let conn = crate::client::connection::Connection::new(Arc::downgrade(&pool));
+        conn.set_status(Status::Running);
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .unwrap_or_else(Instant::now);
+        conn.set_connected_at(Some(long_ago)); // death scores "stable" -> no backoff
+        conn.set_last_activity(long_ago);
+        conn.set_last_write(long_ago);
+        pool.connections.lock().unwrap().push(conn.clone());
+
+        pool.health_round(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            conn.status(),
+            Status::Closed,
+            "both watermarks stale = wedged, must be closed"
+        );
+        let conns = pool.connections.lock().unwrap();
+        assert_eq!(conns.len(), 10, "capacity must be restored to the target");
+    }
+
+    /// A Running tunnel silently waiting for upstream first bytes is
+    /// HEALTHY and must survive: nothing received for a long time
+    /// (legitimate — the server only speaks when the request is done), but
+    /// the 30s keepalive ping still gets out, refreshing the write
+    /// watermark. Only one stale watermark => not wedged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_keeps_running_tunnel_with_fresh_write() {
+        let pool = dummy_pool();
+        let conn = crate::client::connection::Connection::new(Arc::downgrade(&pool));
+        conn.set_status(Status::Running);
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .unwrap_or_else(Instant::now);
+        conn.set_connected_at(Some(long_ago));
+        conn.set_last_activity(long_ago); // nothing received for ages
+                                          // last_write stays "now": the keepalive ping just got out.
+        pool.connections.lock().unwrap().push(conn.clone());
+
+        pool.health_round(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            conn.status(),
+            Status::Running,
+            "a fresh write watermark proves the driver is alive — must not be reaped"
+        );
+    }
+
+    /// A Connecting tunnel older than the reap budget (default 60s when
+    /// `tunneltimeout` is unset) is a zombie: the peer accepted TCP but
+    /// never completed the registration. The health round closes it — a
+    /// never-usable tunnel scores a failure and engages the dial backoff —
+    /// and, the pool being empty, dials exactly one rescue tunnel.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_reaps_stale_connecting_tunnel() {
+        let pool = dummy_pool();
+        let conn = crate::client::connection::Connection::new(Arc::downgrade(&pool));
+        // Status starts Connecting; backdate its creation past the 60s budget.
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .unwrap_or_else(Instant::now);
+        conn.set_created_at(long_ago);
+        pool.connections.lock().unwrap().push(conn.clone());
+
+        pool.health_round(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            conn.status(),
+            Status::Closed,
+            "a stuck Connecting tunnel must be reaped by age"
+        );
+        assert!(
+            pool.in_backoff(),
+            "a never-usable tunnel scores a failure and engages the backoff"
+        );
+        let conns = pool.connections.lock().unwrap();
+        assert_eq!(
+            conns.len(),
+            1,
+            "empty pool in backoff: exactly one rescue tunnel per round"
+        );
+    }
+
+    /// A young Connecting tunnel (within the reap budget) is left alone;
+    /// the round only tops the pool up to the target total.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_round_keeps_young_connecting_tunnel() {
+        let pool = dummy_pool();
+        seed(&pool, 1, Status::Connecting);
+
+        pool.health_round(Duration::from_millis(20)).await;
+
+        let conns = pool.connections.lock().unwrap();
+        let size = pool.size_locked(&conns);
+        assert_eq!(
+            size.connecting,
+            1 + 9,
+            "young connecting kept; only the deficit to the target is dialed"
+        );
+    }
+
+    /// The Connecting reap budget: unset `tunneltimeout` (0 = no per-phase
+    /// limit) still bounds a stuck dial at 60s; a configured value budgets
+    /// the three sequential dial phases plus a scheduling margin.
+    #[test]
+    fn connecting_reap_budgets() {
+        let mut config = new_config();
+        config.tunnel_timeout = 0;
+        assert_eq!(connecting_reap_after(&config), Duration::from_secs(60));
+        config.tunnel_timeout = 8000;
+        assert_eq!(
+            connecting_reap_after(&config),
+            Duration::from_millis(34_000),
+            "3 phases x 8s + 10s margin"
+        );
     }
 }
