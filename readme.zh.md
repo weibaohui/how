@@ -111,6 +111,7 @@ livenesstimeout : 120000    # 关闭静默（半开）空闲隧道前的毫秒�
 dispatchfreshness : 75000   # 毫秒：静默超过该时长的空闲隧道不予派单（直接关闭换下一条）
 busylivenesstimeout : 600000 # 毫秒：静默超过该时长的在忙隧道被关闭（双向分区的最后保险丝）
 secretkey : ThisIsASecret   # 共享密钥；必须与每个客户端的 secretkey 一致
+loglevel : info             # 日志级别：error | warn | info | debug
 ```
 
 服务端是一个透明的全路径反向代理：**除 `/register` 与 `/status` 外，所有路径都会转发给 HOW 客户端**。调用方无需提供目的地头，真实上游由客户端依据 `routes` 解析。
@@ -160,6 +161,7 @@ poolmaxsize : 100                    # 每个服务端的并发 WS 隧道硬上�
 livenesstimeout : 90000              # 卡死兜底：队列塞满无法探活且静默该时长的隧道判死
 healthcheckinterval : 30000          # 池健康巡检间隔（探活 + 状态打印 + 补足），毫秒
 secretkey : ThisIsASecret            # 必须与服务端的 secretkey 一致
+loglevel : info                        # 日志级别：error | warn | info | debug
 
 # 路由表：请求 Host（调用方访问服务端时使用的 Host）
 #        -> 上游 base URL。客户端会追加请求路径。
@@ -304,3 +306,7 @@ make test           # Rust 套件（cargo test --test e2e）——串行运行
 ### CLI 参数
 
 `how-server` 与 `how-client` 均接受 Go 风格参数：`-config <file>`、`--config <file>` 或 `-config=<file>`。默认值：server → `config.server.example.cfg`；client → `config.client.example.cfg`。`how-test-api` 使用 `-addr <host:port>`（默认 `localhost:8081`）。
+
+### 日志级别
+
+两个二进制都从各自的配置文件读取 `loglevel`：`error`、`warn`、`info`（默认）、`debug`。级别低于或等于配置值的日志才会输出；未配置/留空等同 `info`，非法值回退到 `info` 并打印告警。大致划分：`error` 仅失败；`warn` 为已处理的异常（被清理的死链/半开隧道、拨号退避、超时、被下限钳制的配置值）；`info` 含启动信息、访问日志、隧道生命周期、健康巡检摘要；`debug` 为周期性池统计与客户端单请求路由解析细节。

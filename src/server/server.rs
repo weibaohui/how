@@ -62,7 +62,7 @@ pub struct Server {
 /// Build a proxy error response (HTTP 526) carrying the error message.
 /// Mirrors Go's `common.ProxyError` / `ProxyErrorf`.
 fn proxy_error_response(msg: &str) -> Response<Boxed> {
-    log::log(msg.to_string());
+    log::log_warn(msg.to_string());
     Response::builder()
         .status(
             StatusCode::from_u16(proxy_error_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -125,7 +125,7 @@ impl Server {
             let (stream, peer) = match listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
-                    log::log(format!("accept error : {}", e));
+                    log::log_error(format!("accept error : {}", e));
                     continue;
                 }
             };
@@ -146,7 +146,7 @@ impl Server {
                     .await
                 {
                     let _ = peer;
-                    log::log(format!("http connection error : {}", e));
+                    log::log_error(format!("http connection error : {}", e));
                 }
             });
         }
@@ -184,7 +184,8 @@ fn clean(inner: &Arc<Inner>) {
             kept.push(pool);
         }
     }
-    log::log(format!(
+    // Every 5s: periodic stats, too chatty for info — debug only.
+    log::log_debug(format!(
         "{} pools, {} idle, {} busy",
         kept.len(),
         idle,
@@ -233,7 +234,7 @@ async fn acquire(
                 // next one.
                 let silent = conn.last_activity().elapsed();
                 if silent > fresh_for {
-                    log::log(format!(
+                    log::log_warn(format!(
                         "Not dispatching tunnel#{} from {}: no frame for {}ms (stale > {}ms); \
                          closing and trying the next tunnel",
                         conn.id,
@@ -372,7 +373,7 @@ fn host_name(host_header: &str) -> String {
 
 /// Build a 403 Forbidden response with a message body.
 fn forbidden(msg: &str) -> Response<Boxed> {
-    log::log(msg.to_string());
+    log::log_warn(msg.to_string());
     Response::builder()
         .status(StatusCode::FORBIDDEN)
         .body(Full::new(Bytes::copy_from_slice(msg.as_bytes())).boxed())
@@ -499,7 +500,7 @@ async fn handle_request(
             Ok(r) => r,
             Err(_) => {
                 let waited_ms = roundtrip_start.elapsed().as_millis();
-                log::log(format!(
+                log::log_warn(format!(
                     "代理往返超时（upstreamtimeout={}ms）：[{}] {} 已等待={waited_ms}ms",
                     inner.config.upstream_timeout, method, req_url,
                 ));
@@ -524,7 +525,7 @@ async fn handle_request(
             h
         }
         Err((log_msg, user_msg)) => {
-            log::log(format!(
+            log::log_warn(format!(
                 "代理往返失败：[{}] {} 原因={} 耗时={}ms",
                 method,
                 req_url,
@@ -610,7 +611,7 @@ async fn handle_register(inner: Arc<Inner>, req: Request<Incoming>) -> Response<
         let upgraded = match hyper::upgrade::on(req).await {
             Ok(u) => u,
             Err(e) => {
-                log::log(format!("Unable to upgrade : {}", e));
+                log::log_error(format!("Unable to upgrade : {}", e));
                 return;
             }
         };
@@ -634,27 +635,27 @@ where
     let greeting = match ws.next().await {
         Some(Ok(msg)) => msg,
         _ => {
-            log::log("Unable to read greeting message");
+            log::log_error("Unable to read greeting message");
             return;
         }
     };
     let greeting_text = match msg_text(&greeting) {
         Some(t) => t,
         None => {
-            log::log("Unable to parse greeting message");
+            log::log_error("Unable to parse greeting message");
             return;
         }
     };
     let parts: Vec<&str> = greeting_text.splitn(2, '_').collect();
     if parts.len() != 2 {
-        log::log("Unable to parse greeting message");
+        log::log_error("Unable to parse greeting message");
         return;
     }
     let id = parts[0].to_string();
     let size: usize = match parts[1].parse() {
         Ok(n) => n,
         Err(_) => {
-            log::log("Unable to parse greeting message");
+            log::log_error("Unable to parse greeting message");
             return;
         }
     };

@@ -65,7 +65,7 @@ impl Client {
             proxy_env.no_proxy.as_deref().unwrap_or("(unset)"),
         ));
         if matches!(proxy_mode, proxy::ProxyMode::Env) && proxy_env.any_proxy_set() {
-            log::log(
+            log::log_warn(
                 "  WARNING: ambient proxy variables above are ACTIVE because no 'proxy' is set \
                  in the config — upstream requests will go through them. Set 'proxy: none' \
                  (always direct) or 'proxy: <url>' (explicit) to control this."
@@ -109,7 +109,7 @@ impl Client {
         let http_client = match builder.build() {
             Ok(c) => c,
             Err(e) => {
-                log::log(format!(
+                log::log_error(format!(
                     "reqwest client build failed ({e}); falling back to a default client — \
                      proxy rules, timeouts and the IPv4 pin are LOST in this mode"
                 ));

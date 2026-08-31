@@ -90,7 +90,7 @@ impl Pool {
                     // the slot frees up.
                     let silent_ms = connection.last_activity().elapsed().as_millis() as i64;
                     if silent_ms > self.busy_liveness_timeout_ms {
-                        log::log(format!(
+                        log::log_warn(format!(
                             "Reaping stuck busy tunnel#{} from {} (no frame for {}ms)",
                             connection.id, connection.pool_id, silent_ms
                         ));
@@ -110,7 +110,7 @@ impl Pool {
                     // waiting for the OS TCP keepalive (~2 hours).
                     let last_activity_ms = connection.last_activity().elapsed().as_millis() as i64;
                     if last_activity_ms > self.liveness_timeout_ms {
-                        log::log(format!(
+                        log::log_warn(format!(
                             "Reaping half-open tunnel#{} from {} (no frame for {}ms)",
                             connection.id, connection.pool_id, last_activity_ms
                         ));
