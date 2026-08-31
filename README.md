@@ -148,6 +148,7 @@ livenesstimeout : 120000    # ms before closing a silent (half-open) idle tunnel
 dispatchfreshness : 75000   # ms: an idle tunnel silent this long is closed, not dispatched
 busylivenesstimeout : 600000 # ms: a busy tunnel silent this long is closed (partition fuse)
 secretkey : ThisIsASecret   # shared secret; must match every client's secretkey
+loglevel : info             # error | warn | info | debug
 ```
 
 The server is a transparent catch-all reverse proxy: **every path except
@@ -259,6 +260,7 @@ poolmaxsize : 100                    # max concurrent WS tunnels per server
 livenesstimeout : 90000              # wedge backstop: full-queue tunnel silent this long = dead
 healthcheckinterval : 30000          # ms between pool health rounds (probe + status log + refill)
 secretkey : ThisIsASecret            # must match the server's secretkey
+loglevel : info                        # error | warn | info | debug
 
 # Route map: arrival host (the Host the caller targets on the server)
 #            -> upstream base URL. The client appends the request path.
@@ -430,3 +432,14 @@ Both `how-server` and `how-client` accept Go-style flags: `-config <file>`,
 `--config <file>`, or `-config=<file>`. Defaults: server →
 `config.server.example.cfg`; client → `config.client.example.cfg`.
 `how-test-api` uses `-addr <host:port>` (default `localhost:8081`).
+
+### Log levels
+
+Both binaries read `loglevel` from their config file: `error`, `warn`,
+`info` (default) or `debug`. A line is printed when its level is at or below
+the configured one; unset/empty means `info`, and an invalid value falls
+back to `info` with a warning. Roughly: `error` = failures only; `warn` =
+abnormal-but-handled conditions (reaped dead/half-open tunnels, dial
+backoff, timeouts, clamped config values); `info` = startup, access log,
+tunnel lifecycle, health summaries; `debug` = periodic pool statistics and
+per-request route resolution on the client.

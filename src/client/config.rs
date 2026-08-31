@@ -99,6 +99,11 @@ pub struct Config {
     pub blacklist: Vec<Rule>,
     #[serde(rename = "secretkey", default)]
     pub secret_key: String,
+    /// Log output level: "error", "warn", "info" (default) or "debug".
+    /// Messages above the configured level are suppressed. Empty / unset =
+    /// "info"; an invalid value falls back to "info" with a warning.
+    #[serde(rename = "loglevel", default)]
+    pub log_level: String,
     /// Outbound proxy for upstream requests. Unset (empty) = follow the
     /// ambient http_proxy/https_proxy/all_proxy variables (backwards
     /// compatible; a startup WARNING is logged when any is set — reqwest
@@ -163,6 +168,7 @@ pub fn new_config() -> Config {
         whitelist: Vec::new(),
         blacklist: Vec::new(),
         secret_key: String::new(),
+        log_level: String::new(),
         proxy: String::new(),
         noproxy: Vec::new(),
         routes: HashMap::new(),
@@ -200,7 +206,7 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.health_check_interval <= 0 {
         config.health_check_interval = default_health_check_interval();
     } else if config.health_check_interval < MIN_HEALTH_CHECK_INTERVAL_MS {
-        log::log(format!(
+        log::log_warn(format!(
             "healthcheckinterval {}ms is below the minimum {}ms (a health round waits up to \
              the {}ms probe deadline for every idle tunnel's pong); falling back to default {}ms",
             config.health_check_interval,
@@ -226,11 +232,18 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     // a bogus value would otherwise fail every request at dial time.
     let p = config.proxy.trim();
     if !p.is_empty() && !p.eq_ignore_ascii_case("none") && !p.starts_with("http") {
-        log::log(format!(
+        log::log_warn(format!(
             "proxy '{p}' does not look like an http(s):// URL; the client only supports \
              HTTP proxies — treating it as-is anyway, expect upstream failures if it is wrong"
         ));
     }
+    // Apply the configured log level LAST so every load-path warning above
+    // is still printed (the level only gates messages logged from here on).
+    // Skipped under cfg(test): load_configuration runs in many parallel
+    // tests and flipping the process-global level would race them; the
+    // application logic itself is covered by src/log.rs unit tests.
+    #[cfg(not(test))]
+    log::set_level_from_str(&config.log_level);
     Ok(config)
 }
 
@@ -366,5 +379,16 @@ mod tests {
         assert_eq!(c.tunnel_timeout, 8000);
         assert_eq!(c.stream_idle_timeout, 60_000);
         assert_eq!(c.upstream_idle_timeout, 30_000);
+    }
+
+    /// `loglevel` is parsed as a plain string: unset stays empty (the loader
+    /// applies the default), a configured value is preserved as-is. Applying
+    /// the level is disabled under cfg(test) — see load_configuration — so
+    /// only the field itself is asserted here.
+    #[test]
+    fn loglevel_unset_is_empty_and_configured_value_is_preserved() {
+        assert_eq!(load_with("").log_level, "");
+        assert_eq!(load_with("loglevel: debug").log_level, "debug");
+        assert_eq!(load_with("loglevel: error").log_level, "error");
     }
 }

@@ -215,6 +215,9 @@ impl Connection {
     /// the websocket. The request body is sent separately as a stream of binary
     /// messages terminated by an empty binary end-marker.
     pub async fn send_request_header(&self, req: &HttpRequest) -> Result<(), String> {
+        // INFO on purpose: the "via tunnel#N" correlation with the client's
+        // "[tunnel#N …]" lines is the cross-end observability contract
+        // asserted by tests/e2e.rs::test_tunnel_id_correlation.
         log::log(format!(
             "proxy request to {} via tunnel#{}",
             self.pool_id, self.id

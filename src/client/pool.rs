@@ -23,7 +23,7 @@ where
     match tokio::spawn(f).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            log::log(format!("{label} panicked ({e}); continuing next interval"));
+            log::log_error(format!("{label} panicked ({e}); continuing next interval"));
             Err(e)
         }
     }
@@ -131,7 +131,7 @@ impl Pool {
         // One line per failure event: while backing off the connector dials
         // at the backoff cadence (not 1s), so this is naturally low-noise
         // and makes the backoff observable in the field.
-        log::log(format!(
+        log::log_warn(format!(
             "Connection failure #{failures}: backing off {secs}s before the next dial"
         ));
     }
@@ -219,7 +219,7 @@ impl Pool {
         if *last != Some(key) {
             *last = Some(key);
             let total = connecting + idle + running;
-            log::log(format!(
+            log::log_debug(format!(
                 "pool: {total} tunnel{} (connecting={connecting}, idle={idle}, running={running})",
                 if total == 1 { "" } else { "s" }
             ));
@@ -284,7 +284,7 @@ impl Pool {
         for conn in connecting_conns {
             if conn.created_at().elapsed() > connecting_reap {
                 reaped_connecting += 1;
-                log::log(format!(
+                log::log_warn(format!(
                     "pool health: tunnel#{} STUCK-CONNECTING for {}s (budget {}s); closing",
                     conn.id(),
                     conn.created_at().elapsed().as_secs(),
@@ -309,7 +309,7 @@ impl Pool {
             let unsent = conn.last_write().elapsed();
             if silent > running_stale && unsent > running_stale {
                 reaped_running += 1;
-                log::log(format!(
+                log::log_warn(format!(
                     "pool health: tunnel#{} WEDGED-RUNNING — no frame received for {}s, none \
                      sent for {}s (threshold {}s); closing",
                     conn.id(),
@@ -350,7 +350,7 @@ impl Pool {
                         .last_pong()
                         .map(|t| format!("{}s ago", t.elapsed().as_secs()))
                         .unwrap_or_else(|| "never".to_string());
-                    log::log(format!(
+                    log::log_warn(format!(
                         "pool health: tunnel#{} DEAD — no pong within {}ms (last pong: {last_pong}); \
                          closing, connector re-establishing",
                         conn.id(),
@@ -396,7 +396,7 @@ impl Pool {
             // interval; a success stabilizes after STABLE_LIFETIME, clears
             // the backoff and lets the normal refill take over.
             if available == 0 {
-                log::log(
+                log::log_warn(
                     "pool health: pool empty while in dial backoff — dialing one rescue tunnel \
                      at the health cadence"
                         .to_string(),
@@ -492,7 +492,7 @@ impl Pool {
                     )
                     .await
                 {
-                    log::log(format!("Unable to connect to {} : {}", target, e));
+                    log::log_error(format!("Unable to connect to {} : {}", target, e));
                     conn_c.shutdown();
                 }
             });

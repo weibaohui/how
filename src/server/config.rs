@@ -62,6 +62,11 @@ pub struct Config {
     pub upstream_timeout: i64,
     #[serde(rename = "secretkey", default)]
     pub secret_key: String,
+    /// Log output level: "error", "warn", "info" (default) or "debug".
+    /// Messages above the configured level are suppressed. Empty / unset =
+    /// "info"; an invalid value falls back to "info" with a warning.
+    #[serde(rename = "loglevel", default)]
+    pub log_level: String,
     /// Allowed arrival hostnames (the hostname part of the request's `Host`
     /// header). When non-empty, a request is only accepted if its `Host`
     /// hostname matches one of these; requests addressed by IP (or any
@@ -128,6 +133,7 @@ pub fn new_config() -> Config {
         // Explicit-only: 0 (= unset) means "no limit".
         upstream_timeout: 0,
         secret_key: String::new(),
+        log_level: String::new(),
         allowed_hosts: Vec::new(),
         allowips: Vec::new(),
         apikeys: Vec::new(),
@@ -164,7 +170,7 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
         // Below ~1.3x the client's 30s ping cadence a healthy idle tunnel
         // would be closed between pings — pure churn, the client just
         // redials it. Degrade to the safe default with a warning.
-        log::log(format!(
+        log::log_warn(format!(
             "dispatchfreshness {}ms is below the minimum {}ms (must exceed the client's 30s \
              ping cadence with margin); falling back to default {}ms",
             config.dispatch_freshness,
@@ -176,7 +182,7 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     if config.busy_liveness_timeout <= 0 {
         config.busy_liveness_timeout = default_busy_liveness_timeout();
     } else if config.busy_liveness_timeout < MIN_BUSY_LIVENESS_TIMEOUT_MS {
-        log::log(format!(
+        log::log_warn(format!(
             "busylivenesstimeout {}ms is below the minimum {}ms (must exceed the client's 30s \
              ping cadence with margin); falling back to default {}ms",
             config.busy_liveness_timeout,
@@ -187,6 +193,13 @@ pub fn load_configuration(path: &str) -> Result<Config, String> {
     }
     // upstreamtimeout is explicit-only: absent or <= 0 stays "no limit" —
     // nothing is applied that was not configured.
+    // Apply the configured log level LAST so every load-path warning above
+    // is still printed (the level only gates messages logged from here on).
+    // Skipped under cfg(test): load_configuration runs in many parallel
+    // tests and flipping the process-global level would race them; the
+    // application logic itself is covered by src/log.rs unit tests.
+    #[cfg(not(test))]
+    log::set_level_from_str(&config.log_level);
     Ok(config)
 }
 
@@ -288,5 +301,16 @@ mod tests {
             load_with("busylivenesstimeout: 900000").busy_liveness_timeout,
             900_000
         );
+    }
+
+    /// `loglevel` is parsed as a plain string: unset stays empty (the loader
+    /// applies the default), a configured value is preserved as-is. Applying
+    /// the level is disabled under cfg(test) — see load_configuration — so
+    /// only the field itself is asserted here.
+    #[test]
+    fn loglevel_unset_is_empty_and_configured_value_is_preserved() {
+        assert_eq!(load_with("").log_level, "");
+        assert_eq!(load_with("loglevel: debug").log_level, "debug");
+        assert_eq!(load_with("loglevel: warn").log_level, "warn");
     }
 }

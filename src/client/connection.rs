@@ -762,7 +762,7 @@ async fn serve(
             None => parsed.path().to_string(),
         };
         let upstream_url = format!("{}{}", upstream_base, path_and_query);
-        log::log(format!("route {} -> {}", authority, upstream_url));
+        log::log_debug(format!("route {} -> {}", authority, upstream_url));
         let url = match reqwest::Url::parse(&upstream_url) {
             Ok(u) => u,
             Err(e) => {
@@ -861,14 +861,14 @@ async fn serve(
             }
             Err((msg, is_timeout)) => {
                 if is_timeout {
-                    log::log(format!(
+                    log::log_warn(format!(
                         "上游调用超时（upstreamtimeout={}ms）：{} 已等待={}ms",
                         config.upstream_timeout,
                         url,
                         call_start.elapsed().as_millis()
                     ));
                 } else {
-                    log::log(format!(
+                    log::log_warn(format!(
                         "上游调用失败：{} 错误={} 已耗时={}ms",
                         url,
                         msg,
@@ -929,7 +929,7 @@ async fn serve(
                         }
                     }
                     Some(Err(e)) => {
-                        log::log(format!("Unable to pipe response body : {}", e));
+                        log::log_error(format!("Unable to pipe response body : {}", e));
                         stream_ok = false;
                         break;
                     }
