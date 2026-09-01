@@ -132,7 +132,8 @@ impl Pool {
         // at the backoff cadence (not 1s), so this is naturally low-noise
         // and makes the backoff observable in the field.
         log::log_warn(format!(
-            "Connection failure #{failures}: backing off {secs}s before the next dial"
+            "server {target} unreachable — connection failure #{failures}; backing off {secs}s before the next dial",
+            target = self.target
         ));
     }
 
