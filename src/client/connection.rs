@@ -427,13 +427,31 @@ impl Connection {
         // it accomplished — pairs with the per-request "[tunnel#N …]" lines.
         let served = self.served.load(std::sync::atomic::Ordering::Relaxed);
         match self.connected_at() {
-            Some(t) => log::log(format!(
-                "tunnel#{} closed (lived {}s, served {} request{})",
-                self.id(),
-                t.elapsed().as_secs(),
-                served,
-                if served == 1 { "" } else { "s" }
-            )),
+            Some(t) => {
+                let lived = t.elapsed();
+                if served == 0 && lived < STABLE_LIFETIME {
+                    // Connected (handshake ok) then closed within the
+                    // stability window without ever serving a request:
+                    // the server accepted the connection then dropped it.
+                    // WARN (not the normal info close line) so an
+                    // unreachable-or-rejecting server is not buried under
+                    // misleading "Connected" lines.
+                    log::log_warn(format!(
+                        "tunnel#{} closed (lived {}s, served 0) — server accepted the connection \
+                         then closed it shortly after; the server may be rejecting registrations or misconfigured",
+                        self.id(),
+                        lived.as_secs()
+                    ));
+                } else {
+                    log::log(format!(
+                        "tunnel#{} closed (lived {}s, served {} request{})",
+                        self.id(),
+                        lived.as_secs(),
+                        served,
+                        if served == 1 { "" } else { "s" }
+                    ));
+                }
+            }
             None => log::log(format!(
                 "tunnel#{} closed (never usable — dial, handshake or greeting failed)",
                 self.id()
