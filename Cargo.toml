@@ -1,6 +1,6 @@
 [package]
 name = "how"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 description = "HOW — transparent reverse HTTP proxy over WebSockets"
 license = "MIT"
