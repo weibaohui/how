@@ -325,10 +325,21 @@ async fn driver<S>(
     loop {
         // Flush any pong queued from a received ping before polling again so
         // we never call stream.send() while the stream.next() future is alive
-        // inside select!.
+        // inside select!. The flush itself must stay cancellable: on a dead
+        // or fully backlogged path a send can block in the kernel indefinitely
+        // (TCP retransmitting into the void). A flush outside any cancel
+        // branch would wedge the driver here forever — `close()` (cancel)
+        // could then never take effect, and the tunnel's socket would leak
+        // (observed in the field: a reaped tunnel stuck in CLOSE-WAIT with a
+        // full send queue for hours after `close()`).
         if let Some(p) = pending_pong.take() {
-            if stream.send(Message::Pong(p)).await.is_err() {
-                break;
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                r = stream.send(Message::Pong(p)) => {
+                    if r.is_err() {
+                        break;
+                    }
+                }
             }
         }
         tokio::select! {
@@ -365,8 +376,18 @@ async fn driver<S>(
             out = write_rx.recv() => {
                 match out {
                     Some(m) => {
-                        if stream.send(m).await.is_err() {
-                            break;
+                        // Cancellable for the same reason as the pong flush:
+                        // sending a proxied frame into a dead/backlogged path
+                        // must block the driver at most until `close()`, never
+                        // wedge it (a wedged driver holds the tunnel's socket
+                        // and status transitions forever).
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            r = stream.send(m) => {
+                                if r.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     None => break,
@@ -401,4 +422,88 @@ pub(crate) async fn dummy_connection(
         Connection::new("test-pool".to_string(), id, ws, idle_tx),
         peer,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Field regression: a tunnel whose path died with data queued
+    //! (`CLOSE-WAIT` + full send queue observed for hours after `close()`).
+    //! The driver's sends must be cancellable: when `close()` fires while the
+    //! driver is blocked in `stream.send()` against a peer that never reads,
+    //! the driver must still exit (dropping the read channel, freeing the
+    //! socket) instead of wedging on the blocked send forever.
+
+    use super::*;
+    use std::time::Duration;
+
+    /// `close()` while the driver is blocked sending a proxied data frame:
+    /// the driver exits and pending readers are unblocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_releases_driver_wedged_on_blocked_data_send() {
+        let (idle_tx, _idle_rx) = mpsc::channel(8);
+        let (conn, peer) = dummy_connection(1, idle_tx).await;
+        // HOLD the peer and never read it: the 64-byte duplex fills up and
+        // the driver's send blocks in the kernel. Dropping it would be an
+        // EOF that ends the driver on its own, masking the bug.
+        let _peer_hold = peer;
+
+        // One frame far larger than the duplex buffer: the driver picks it
+        // off the write channel and blocks in stream.send().
+        conn.send_body_chunk(Bytes::from(vec![0u8; 4096]))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        conn.close();
+
+        // The driver must exit despite the blocked send: dropping read_tx
+        // turns a pending recv into an immediate "reader gone" error.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(2), conn.recv_response_header()).await;
+        assert!(
+            outcome.is_ok(),
+            "driver wedged on a blocked send ignored close()"
+        );
+        assert!(conn.is_closed());
+    }
+
+    /// `close()` while the driver is blocked flushing a queued pong: same
+    /// wedge, different send site.
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_releases_driver_wedged_on_blocked_pong_flush() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (idle_tx, _idle_rx) = mpsc::channel(8);
+        let (conn, peer) = dummy_connection(2, idle_tx).await;
+        // A live websocket peer that sends pings but never reads responses.
+        let mut peer_ws = WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
+
+        // Keep sending pings from a background task; ignore the eventual
+        // send block / close error.
+        tokio::spawn(async move {
+            loop {
+                if peer_ws
+                    .send(Message::Ping(bytes::Bytes::from_static(b"x")))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // The pongs queued by the driver accumulate in the 64-byte duplex
+        // until the flush itself blocks.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        conn.close();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(2), conn.recv_response_header()).await;
+        assert!(
+            outcome.is_ok(),
+            "driver wedged on a blocked pong flush ignored close()"
+        );
+        assert!(conn.is_closed());
+    }
 }
